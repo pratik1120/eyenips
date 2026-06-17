@@ -1,7 +1,7 @@
 # Eyenips
 
 A beginner-friendly, audio-reactive visualization studio — think *WinAmp
-visualizations meets a tiny TouchDesigner*. Pick an effect, turn knobs, choose
+visualizations meets TouchDesigner*. Pick an effect, turn knobs, choose
 colors, flip on grain / fluid / flicker, and bind any knob to the music. When
 you want more, drop a Python file in `effects/` and it shows up automatically.
 
