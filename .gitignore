@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Eyenips runtime / user data
+.vizsession.viz
+presets/
+
+# Editor / tooling
+.vscode/
+.claude/
+
+# OS cruft
+Thumbs.db
+ehthumbs.db
+desktop.ini
+.DS_Store
+
+# Renders / exports
+*.mp4
+*.mov
+*.gif

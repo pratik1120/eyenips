@@ -1,0 +1,10 @@
+taichi>=1.7.4     # 1.7.4 is the first wheel built for Python 3.13
+numpy>=1.21
+# audio capture (optional but recommended). If any are missing the app still
+# runs - audio just stays "off".
+soundcard>=0.4.3     # system-loopback + mic capture on Windows (WASAPI)
+soundfile>=0.12      # decode audio files
+sounddevice>=0.4.6   # play audio files
+imageio-ffmpeg>=0.5  # bundles the ffmpeg binary used for MP4 export
+pillow>=9.0          # draws the live visual inside the app window
+opencv-python>=4.5   # camera / image / video input (optional; media stays off without it)

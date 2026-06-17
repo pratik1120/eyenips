@@ -1,0 +1,623 @@
+"""The engine: owns the canvas, the colors, the audio, the post-FX, and the
+render loop. It ties an Effect together with everything it needs.
+
+Single-threaded by design: the render loop runs on the main thread and, each
+frame, hands the rendered image to a `display` callback (the Tk preview) and
+calls an `on_frame` callback (to pump the Tk controls). So the whole app -
+visuals and controls - lives in one window. The UI only mutates a thread-safe
+ParamStore; the engine reads it each frame and is the only thing that talks
+to Taichi.
+"""
+
+import threading
+import time
+
+import numpy as np
+import taichi as ti
+
+from . import color
+from . import shapes as shapelib
+from .effect import Context
+from .params import Slider, ColorPalette
+from .postfx import PostFX, global_params
+from .media import media_params, BLEND_IDS
+from .shapes_fx import ShapesCompositor
+
+
+class ParamStore:
+    """Thread-safe bag of current knob values + per-knob audio bindings."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.values = {}          # name -> value
+        self.audio_src = {}       # name -> "none"/"bass"/... (sliders only)
+        self.audio_amt = {}       # name -> 0..1
+        self.params = {}          # name -> Param object (meta)
+
+    def load(self, params):
+        with self._lock:
+            for p in params:
+                self.params[p.name] = p
+                self.values.setdefault(p.name, p.coerce(p.default))
+                if isinstance(p, Slider):
+                    self.audio_src.setdefault(p.name, p.drive_source)
+                    self.audio_amt.setdefault(p.name, p.drive_amount)
+
+    def set(self, name, value):
+        with self._lock:
+            p = self.params.get(name)
+            self.values[name] = p.coerce(value) if p else value
+
+    def set_audio(self, name, source=None, amount=None):
+        with self._lock:
+            if source is not None:
+                self.audio_src[name] = source
+            if amount is not None:
+                self.audio_amt[name] = float(amount)
+
+    def snapshot(self):
+        with self._lock:
+            return (dict(self.values), dict(self.audio_src), dict(self.audio_amt))
+
+    def to_dict(self):
+        """JSON-serializable copy of this store's knob values + audio bindings."""
+        with self._lock:
+            return {"values": dict(self.values),
+                    "audio_src": dict(self.audio_src),
+                    "audio_amt": dict(self.audio_amt)}
+
+    def load_dict(self, d):
+        """Apply saved values/bindings onto an already-loaded store."""
+        with self._lock:
+            for name, val in (d.get("values") or {}).items():
+                p = self.params.get(name)
+                self.values[name] = p.coerce(val) if p else val
+            self.audio_src.update(d.get("audio_src") or {})
+            self.audio_amt.update({k: float(v) for k, v in (d.get("audio_amt") or {}).items()})
+
+
+@ti.data_oriented
+class MediaCompositor:
+    """Owns the media frame + camera-motion fields, computes motion, and (for
+    the optional 'Background' mode) blends media with the canvas."""
+
+    def __init__(self, canvas, media, motion, prev):
+        self.canvas = canvas
+        self.media = media
+        self.motion = motion     # ti.field(f32): camera-motion magnitude 0..1
+        self.prev = prev         # ti.field(f32): previous-frame luma
+        self.w, self.h = canvas.shape[0], canvas.shape[1]
+
+    @ti.func
+    def _smp(self, u, v):
+        """Bilinear sample of the media at normalized (u, v), clamped to edges."""
+        fx = u * (self.w - 1)
+        fy = v * (self.h - 1)
+        x0 = ti.cast(ti.floor(fx), ti.i32)
+        y0 = ti.cast(ti.floor(fy), ti.i32)
+        ax = fx - x0
+        ay = fy - y0
+        x0 = ti.max(0, ti.min(self.w - 1, x0))
+        y0 = ti.max(0, ti.min(self.h - 1, y0))
+        x1 = ti.min(self.w - 1, x0 + 1)
+        y1 = ti.min(self.h - 1, y0 + 1)
+        a = self.media[x0, y0] * (1 - ax) + self.media[x1, y0] * ax
+        b = self.media[x0, y1] * (1 - ax) + self.media[x1, y1] * ax
+        return a * (1 - ay) + b * ay
+
+    @ti.kernel
+    def update_motion(self, gain: ti.f32, decay: ti.f32):
+        for i, j in self.media:
+            m = self.media[i, j]
+            luma = (m[0] + m[1] + m[2]) * 0.33333
+            d = ti.abs(luma - self.prev[i, j]) * gain
+            self.motion[i, j] = ti.max(self.motion[i, j] * decay, ti.min(d, 1.0))
+            self.prev[i, j] = luma
+
+    @ti.kernel
+    def composite(self, mode: ti.i32, a: ti.f32, br: ti.f32):
+        one = ti.Vector([1.0, 1.0, 1.0])
+        for i, j in self.canvas:
+            E = self.canvas[i, j]
+            M = self.media[i, j] * br
+            Ec = ti.Vector([ti.min(ti.max(E[0], 0.0), 1.0),
+                            ti.min(ti.max(E[1], 0.0), 1.0),
+                            ti.min(ti.max(E[2], 0.0), 1.0)])
+            out = E
+            if mode == 1:          # Behind: media shows, effect glows on top
+                out = M * a + E
+            elif mode == 2:        # Tint: effect colors/lights the media
+                fac = ti.Vector([(1.0 - a) + a * Ec[0],
+                                 (1.0 - a) + a * Ec[1],
+                                 (1.0 - a) + a * Ec[2]])
+                out = M * fac
+            elif mode == 3:        # Screen: lighten media by the effect
+                sc = one - (one - M) * (one - Ec)
+                out = M * (1.0 - a) + sc * a
+            elif mode == 4:        # Warp: distort the media using the effect's colors
+                u = i / self.w + (Ec[0] - 0.5) * a * 0.4
+                v = j / self.h + (Ec[1] - 0.5) * a * 0.4
+                out = self._smp(u, v) * br
+            self.canvas[i, j] = out
+
+
+@ti.data_oriented
+class Presenter:
+    """Packs the final float canvas into an image-oriented uint8 RGB buffer on
+    the GPU — transpose (x,y)->(row,col), vertical flip, clamp to [0,1] and
+    scale to bytes, all in one kernel. The UI then reads back a buffer that's a
+    quarter of the float canvas' size and needs zero per-pixel CPU work, so the
+    preview blit stops being the bottleneck. buf is laid out (H rows, W cols, 3)
+    exactly like the image the UI used to build on the CPU."""
+
+    def __init__(self, canvas):
+        self.canvas = canvas
+        self.w, self.h = canvas.shape[0], canvas.shape[1]
+        self.buf = ti.field(ti.u8, shape=(self.h, self.w, 3))
+
+    @ti.kernel
+    def pack(self):
+        for x, y in self.canvas:
+            row = self.h - 1 - y                  # flip: canvas y-up -> image top-down
+            v = self.canvas[x, y]
+            for c in ti.static(range(3)):
+                u = ti.min(ti.max(v[c], 0.0), 1.0)
+                self.buf[row, x, c] = ti.cast(u * 255.0 + 0.5, ti.u8)
+
+
+class Engine:
+    def __init__(self, width=1280, height=800, audio=None, media=None):
+        self.w = width
+        self.h = height
+        self.audio = audio
+        self.media = media
+        self.canvas = ti.Vector.field(3, ti.f32, shape=(width, height))
+        self.palette = ti.Vector.field(3, ti.f32, shape=256)
+        self.media_field = ti.Vector.field(3, ti.f32, shape=(width, height))
+        self.motion_field = ti.field(ti.f32, shape=(width, height))
+        self._prev_luma = ti.field(ti.f32, shape=(width, height))
+        self.postfx = PostFX(width, height, self.canvas)
+        # GPU "present" path: pack the canvas to a uint8 image the UI can blit
+        # directly. If it can't be built on this backend we fall back to the old
+        # float readback in run(), so the app still works no matter what.
+        try:
+            self.presenter = Presenter(self.canvas)
+        except Exception:
+            self.presenter = None
+        self.media_fx = MediaCompositor(self.canvas, self.media_field,
+                                        self.motion_field, self._prev_luma)
+        # shapes are a LAYER over the active effect (mask / warp / tint / overlay)
+        self.shapes_fx = ShapesCompositor(self.canvas, self.palette)
+        self._shapes_np = np.zeros((shapelib.MAX_SHAPES, shapelib.NF), np.float32)
+        self._shapes_count = 0
+        # per-shape "show a different effect": name->class catalog + the live
+        # secondary effect instances (slot 1..MAX_FX_SLOTS), each a full effect
+        # with its OWN params, look/post-FX and palette, rendering into a buffer.
+        self.effect_catalog = {}      # effect name -> class
+        self._fx_wanted = {}          # slot -> (shape_id, effect_name)
+        self._fx_active = {}          # slot -> dict(slot,id,name,inst,ctx,store,...)
+        self._fx_dirty = False
+        # each slot gets its own palette LUT so its colors are independent
+        self._fx_pal = [ti.Vector.field(3, ti.f32, shape=256)
+                        for _ in range(shapelib.MAX_FX_SLOTS)]
+        # remember each shape-effect's knob values across slot renumbering
+        self._fx_store_cache = {}     # (shape_id, effect_name) -> ParamStore
+        self.ctx = Context(width, height, self.canvas, self.palette)
+        # media fields are stable refs effects can sample any time
+        self.ctx.media = self.media_field
+        self.ctx.media_motion = self.motion_field
+        self._media_cleared = True
+        self.store = ParamStore()
+        if self.media is not None:
+            self.media.set_target(width, height)
+
+        self.effect = None
+        self.params = []           # merged: global + effect params
+        self.effect_version = 0    # bumped on every effect swap (UI watches this)
+        self._pending_effect = None
+        self._pending_reset = False
+        self._pending_export = None
+        self._pending_expr = None
+        self._pending_shapes = False  # shape array changed -> re-upload
+        self.effect_error = ""     # last error from a (user) effect, for the UI
+        self._last_palette = None
+        self._start = time.perf_counter()
+        self._last = self._start
+        self.paused = False
+        self.running = True
+
+    # ---- effect management ---------------------------------------------
+    def set_effect(self, effect):
+        """Make `effect` active. Never crashes the app: a broken user effect is
+        caught, reported via self.effect_error, and the previous effect kept."""
+        prev = self.effect
+        prev_params, prev_store = self.params, self.store
+        self.params = global_params() + media_params() + list(effect.params)
+        self.store = ParamStore()
+        self.store.load(self.params)
+        self._last_palette = None
+        self._upload_palette(force=True)
+        try:
+            effect.setup(self.ctx)
+        except Exception as e:
+            self.effect_error = f"setup failed: {type(e).__name__}: {e}"
+            # roll back to the previous effect so the app keeps running
+            self.effect = prev
+            self.params, self.store = prev_params, prev_store
+            if prev is not None:
+                self._upload_palette(force=True)
+            return False
+        self.effect = effect
+        self.effect_error = getattr(effect, "error", "")
+        self._clear_canvas()
+        self._start = time.perf_counter()
+        self.effect_version += 1
+        return True
+
+    def request_effect(self, effect_cls_or_instance):
+        """Swap effect on the engine thread. Accepts a class OR an instance
+        (the live code editor builds instances)."""
+        self._pending_effect = effect_cls_or_instance
+
+    def request_reset(self):
+        self._pending_reset = True
+
+    def request_export(self, config):
+        """config: dict(audio_path, out_path, fps, seconds, progress)."""
+        self._pending_export = config
+
+    def apply_expression(self, bright, hue, source=None):
+        """Live-update the active expression effect's formulas (engine thread)."""
+        self._pending_expr = (bright, hue, source)
+
+    def set_effect_catalog(self, classes):
+        """Tell the engine which effects exist (name -> class), so a shape can
+        show a secondary effect by name. Safe to call any time."""
+        self.effect_catalog = {c.name: c for c in classes}
+
+    # ---- save / load (engine-owned state) ------------------------------
+    def export_state(self):
+        """The engine's slice of a project: the active effect, its knobs, and
+        every per-shape effect's knobs."""
+        fx = []
+        for (sid, name), store in self._fx_store_cache.items():
+            d = store.to_dict(); d["id"] = sid; d["effect"] = name
+            fx.append(d)
+        return {
+            "effect": self.effect.name if self.effect else None,
+            "params": self.store.to_dict(),
+            "shape_fx": fx,
+        }
+
+    def import_state(self, data):
+        """Restore the engine's slice of a project (effect + knobs + shape-fx
+        knob caches). Runs on the render thread (single-threaded app)."""
+        name = data.get("effect")
+        cls = self.effect_catalog.get(name)
+        if cls is not None and self.set_effect(cls()):
+            self.store.load_dict(data.get("params") or {})
+            self._upload_palette(force=True)
+        # rebuild the per-shape effect knob caches so reconcile restores them
+        cache = {}
+        for entry in data.get("shape_fx") or []:
+            sid, ename = entry.get("id"), entry.get("effect")
+            ecls = self.effect_catalog.get(ename)
+            if ecls is None:
+                continue
+            inst = ecls()
+            store = ParamStore()
+            store.load(global_params() + list(inst.params))
+            store.load_dict(entry)
+            cache[(sid, ename)] = store
+        self._fx_store_cache = cache
+        self._fx_wanted = {}        # force reconcile to rebuild instances
+        self._fx_active = {}
+        self._fx_dirty = True
+
+    def request_shapes(self, shape_dicts):
+        """Set the shapes overlay (drawn on top of whatever effect is active).
+        Each "Show effect" shape that shows a non-Primary effect gets its OWN
+        render slot (so two shapes can show the same effect tuned differently),
+        up to MAX_FX_SLOTS. Encodes (cheap) and flags work for the render thread."""
+        shape_dicts = shape_dicts or []
+        wanted = {}                       # slot -> (shape_id, effect_name)
+        slot_by_index = {}                # shape index -> slot
+        next_slot = 1
+        for idx, s in enumerate(shape_dicts):
+            if not shapelib.is_window(s.get("mode", "")):
+                continue
+            name = s.get("effect", shapelib.PRIMARY)
+            if name in (shapelib.PRIMARY, "", None) or name not in self.effect_catalog:
+                continue
+            if next_slot > shapelib.MAX_FX_SLOTS:
+                continue
+            wanted[next_slot] = (s.get("id"), name)
+            slot_by_index[idx] = next_slot
+            next_slot += 1
+
+        self._shapes_np[:] = 0.0
+        n = 0
+        for k, s in enumerate(shape_dicts[:shapelib.MAX_SHAPES]):
+            self._shapes_np[k] = shapelib.encode(s, slot_by_index.get(k, 0))
+            n += 1
+        self._shapes_count = n
+        if wanted != self._fx_wanted:
+            self._fx_wanted = wanted
+            self._fx_dirty = True
+        self._pending_shapes = True
+
+    def shape_fx_for(self, shape_id):
+        """The live secondary-effect slot for a shape id (or None) — the Shape
+        FX panel reads its store + params from here."""
+        for d in self._fx_active.values():
+            if d["id"] == shape_id:
+                return d
+        return None
+
+    def _clear_canvas(self):
+        self.canvas.fill(0)
+
+    # ---- color ----------------------------------------------------------
+    def _upload_palette(self, force=False):
+        # find the (first) palette param's current spec
+        spec = None
+        for p in self.params:
+            if isinstance(p, ColorPalette):
+                spec = self.store.values.get(p.name)
+                break
+        if spec is None:
+            spec = {"named": "rainbow", "custom": []}
+        key = (spec.get("named"), tuple(spec.get("custom", [])))
+        if force or key != self._last_palette:
+            lut = color.build_lut(spec)
+            self.palette.from_numpy(lut.astype(np.float32))
+            self._last_palette = key
+
+    # ---- per-frame param resolution ------------------------------------
+    def _resolve_store(self, store, feats):
+        values, srcs, amts = store.snapshot()
+        out = {}
+        for name, val in values.items():
+            p = store.params.get(name)
+            if isinstance(p, Slider) and feats is not None:
+                src = srcs.get(name, "none")
+                if src != "none":
+                    drive = feats.get(src) * (p.hi - p.lo) * amts.get(name, 0.5)
+                    val = max(p.lo, min(p.hi, val + drive))
+            out[name] = val
+        return out
+
+    def _resolve(self, feats):
+        return self._resolve_store(self.store, feats)
+
+    # ---- secondary effects (shapes showing a different effect) ----------
+    def _reconcile_secondary(self):
+        """Make self._fx_active match self._fx_wanted: build new secondary
+        effect instances (each a full effect with its own params/look/palette),
+        drop unused ones. Runs on the render thread."""
+        self._fx_dirty = False
+        new_active = {}
+        for slot, (sid, name) in self._fx_wanted.items():
+            cur = self._fx_active.get(slot)
+            if cur is not None and cur["id"] == sid and cur["name"] == name:
+                new_active[slot] = cur          # reuse — same shape+effect here
+                continue
+            cls = self.effect_catalog.get(name)
+            if cls is None:
+                continue
+            buf = self.shapes_fx.buffer(slot)
+            pal = self._fx_pal[slot - 1]
+            inst = cls()
+            # full param set: global look (trails/grain/...) + the effect's knobs
+            params = global_params() + list(inst.params)
+            key = (sid, name)
+            store = self._fx_store_cache.get(key)
+            if store is None:               # first time -> defaults; else keep edits
+                store = ParamStore(); store.load(params)
+                self._fx_store_cache[key] = store
+            ctx = Context(self.w, self.h, buf, pal)
+            ctx.media = self.media_field
+            ctx.media_motion = self.motion_field
+            try:
+                inst.setup(ctx)
+            except Exception as e:
+                self.effect_error = f"shape effect '{name}': {type(e).__name__}: {e}"
+                continue
+            new_active[slot] = dict(slot=slot, id=sid, name=name, inst=inst, ctx=ctx,
+                                    store=store, params=params, buf=buf, pal=pal,
+                                    postfx=PostFX(self.w, self.h, buf), palkey=None)
+        # clear any buffer no longer backed by an effect (avoid stale art)
+        for slot in range(1, shapelib.MAX_FX_SLOTS + 1):
+            if slot not in new_active:
+                self.shapes_fx.buffer(slot).fill(0)
+        # prune knob caches for shape-effects that no longer exist
+        live = {(sid, name) for sid, name in self._fx_wanted.values()}
+        self._fx_store_cache = {k: v for k, v in self._fx_store_cache.items() if k in live}
+        self._fx_active = new_active
+
+    def _upload_store_palette(self, d):
+        """Upload a slot's own palette LUT from its ColorPalette knob."""
+        spec = None
+        for p in d["params"]:
+            if isinstance(p, ColorPalette):
+                spec = d["store"].values.get(p.name)
+                break
+        if spec is None:
+            spec = {"named": "rainbow", "custom": []}
+        key = (spec.get("named"), tuple(spec.get("custom", [])))
+        if key != d["palkey"]:
+            d["pal"].from_numpy(color.build_lut(spec).astype(np.float32))
+            d["palkey"] = key
+
+    def _render_secondary(self, feats):
+        """Render each secondary effect (its own knobs + look post-FX + palette)
+        into its buffer so window-shapes can sample it."""
+        for d in self._fx_active.values():
+            self._upload_store_palette(d)
+            c = d["ctx"]
+            c.time = self.ctx.time; c.dt = self.ctx.dt; c.frame = self.ctx.frame
+            c.audio = feats
+            c.has_media = self.ctx.has_media
+            c.p = self._resolve_store(d["store"], feats)
+            if c.p.get("trails"):
+                d["postfx"].decay(float(c.p.get("trail_length", 0.9)))
+            else:
+                d["buf"].fill(0)
+            try:
+                d["inst"].render(c)
+                d["postfx"].apply(c.p, c.time)
+            except Exception as e:
+                self.effect_error = f"shape effect '{d['name']}': {type(e).__name__}: {e}"
+
+    # ---- main loop ------------------------------------------------------
+    def run(self, on_frame=None, display=None, target_fps=60):
+        """Single-threaded render loop.
+
+        We no longer open Taichi's own window. Instead each frame is handed to
+        `display(img)` (the Tk preview) and `on_frame()` pumps the UI, so the
+        whole app lives in ONE window. `target_fps` caps the loop so we don't
+        spin the CPU at 100%."""
+        frame_budget = 1.0 / max(1, target_fps)
+        while self.running:
+            # apply UI-requested swaps on THIS (GPU-owning) thread
+            if self._pending_effect is not None:
+                req = self._pending_effect
+                self._pending_effect = None
+                inst = req() if isinstance(req, type) else req
+                self.set_effect(inst)
+            if self._pending_expr is not None and hasattr(self.effect, "set_formulas"):
+                b, h, src = self._pending_expr
+                self._pending_expr = None
+                self.effect.set_formulas(b, h, src)
+            if self._pending_shapes:
+                self.shapes_fx.upload(self._shapes_np)
+                self._pending_shapes = False
+            if self._fx_dirty:
+                self._reconcile_secondary()
+            if self._pending_reset:
+                self._pending_reset = False
+                if self.effect:
+                    self.effect.reset()
+                self._clear_canvas()
+            if self._pending_export is not None:
+                cfg = self._pending_export
+                self._pending_export = None
+                self._do_export(cfg)
+                self._last = time.perf_counter()  # don't count export time as dt
+
+            now = time.perf_counter()
+            self.ctx.dt = now - self._last
+            self.ctx.time = now - self._start
+            self._last = now
+
+            feats = self.audio.features() if self.audio else None
+            self.ctx.audio = feats
+            self.ctx.p = self._resolve(feats)
+            self._upload_palette()
+
+            if not self.paused:
+                self._update_media()   # refresh media+motion so effects can sample
+
+                # trails: fade old frame instead of full clear
+                if self.ctx.p.get("trails"):
+                    self.postfx.decay(float(self.ctx.p.get("trail_length", 0.9)))
+                else:
+                    self._clear_canvas()
+
+                if self.effect:
+                    try:
+                        self.effect.render(self.ctx)
+                        # surface any error the effect recorded internally
+                        self.effect_error = getattr(self.effect, "error", "")
+                    except Exception as e:
+                        # a user effect threw - report it, don't kill the app
+                        self.effect_error = f"{type(e).__name__}: {e}"
+                self.postfx.apply(self.ctx.p, self.ctx.time)
+                self._composite_media()
+                if self._fx_active:        # shapes showing other effects -> draw them
+                    self._render_secondary(feats)
+                self._composite_shapes()   # shapes interact with the final image
+                self.ctx.frame += 1
+
+            if display is not None:
+                if self.presenter is not None:
+                    # GPU packs canvas -> image-oriented uint8; UI blits as-is.
+                    try:
+                        self.presenter.pack()
+                        display(self.presenter.buf.to_numpy())
+                    except Exception:
+                        self.presenter = None      # never again; use fallback
+                if self.presenter is None:         # fallback: float readback
+                    img = self.canvas.to_numpy()
+                    np.clip(img, 0.0, 1.0, out=img)
+                    display(img)
+            if on_frame is not None:
+                on_frame()
+
+            # frame cap so the loop doesn't peg a CPU core
+            spare = frame_budget - (time.perf_counter() - now)
+            if spare > 0:
+                time.sleep(spare)
+
+        self.running = False
+        if self.audio:
+            self.audio.stop()
+
+    def _update_media(self):
+        """Upload the latest media frame and update the camera-motion field, so
+        effects can SAMPLE ctx.media / ctx.media_motion this frame."""
+        self.ctx.has_media = False
+        if self.media is None:
+            return
+        frame = self.media.frame()
+        if frame is None or frame.shape[:2] != (self.h, self.w):
+            # no live media -> clear the fields once so stale frames don't linger
+            if not self._media_cleared:
+                self.media_field.fill(0)
+                self.motion_field.fill(0)
+                self._prev_luma.fill(0)
+                self._media_cleared = True
+            return
+        # (H,W,3) image -> field[x,y] in the canvas' (x right, y up) orientation
+        arr = np.ascontiguousarray(
+            np.transpose(np.flipud(frame), (1, 0, 2)).astype(np.float32))
+        self.media_field.from_numpy(arr)
+        self.media_fx.update_motion(6.0, 0.85)
+        self.ctx.has_media = True
+        self._media_cleared = False
+
+    def _composite_shapes(self):
+        """Draw the shape elements as a layer that interacts with the effect.
+        Skipped entirely when there are no shapes (zero cost)."""
+        if self._shapes_count == 0:
+            return
+        self.shapes_fx.run(self.ctx.time,
+                           float(self.ctx.p.get("shapes_gain", 1.0)),
+                           self.ctx.audio)
+
+    def _composite_media(self):
+        """OPTIONAL 'Background' mode: blend the media behind/over the effect.
+        Media is already uploaded by _update_media()."""
+        if self.media is None:
+            return
+        blend = self.ctx.p.get("media_blend", "Off")
+        if blend == "Off" or not self.ctx.has_media:
+            return
+        self.media_fx.composite(BLEND_IDS.get(blend, 0),
+                                float(self.ctx.p.get("media_opacity", 1.0)),
+                                float(self.ctx.p.get("media_brightness", 1.0)))
+
+    def _do_export(self, cfg):
+        from .export import export_mp4
+        # pause live audio so it doesn't fight the offline analyzer / CPU
+        was_mode = self.audio._mode if self.audio else "none"
+        was_file = self.audio.current_file() if self.audio else None
+        if self.audio:
+            self.audio.stop()
+        ok, msg = export_mp4(
+            self, cfg["audio_path"], cfg["out_path"],
+            fps=cfg.get("fps", 30), seconds=cfg.get("seconds"),
+            progress=cfg.get("progress"))
+        cfg.get("done", lambda *_: None)(ok, msg)
+        if self.audio and was_mode != "none":
+            self.audio.set_mode(was_mode, was_file)
