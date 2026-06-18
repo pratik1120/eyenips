@@ -9,6 +9,7 @@ ParamStore; the engine reads it each frame and is the only thing that talks
 to Taichi.
 """
 
+import math
 import threading
 import time
 
@@ -19,10 +20,11 @@ from . import color
 from . import shapes as shapelib
 from .effect import Context
 from .params import Slider, ColorPalette
-from .postfx import PostFX, global_params
+from .postfx import PostFX, Feedback, global_params
 from .media import media_params, BLEND_IDS
 from .shapes_fx import ShapesCompositor
 from .modulation import ModEngine
+from .midi import MidiEngine
 from .layers_fx import LayerCompositor, LAYER_BLEND_IDS, MAX_LAYERS
 
 
@@ -188,11 +190,15 @@ class Engine:
             self.presenter = None
         self.media_fx = MediaCompositor(self.canvas, self.media_field,
                                         self.motion_field, self._prev_luma)
+        # frame feedback (infinite tunnels / spirals / echoes) — a post-pass
+        # that recursively blends the previous composited frame back in.
+        self.feedback = Feedback(width, height, self.canvas)
         # shapes are a LAYER over the active effect (mask / warp / tint / overlay)
         self.shapes_fx = ShapesCompositor(self.canvas, self.palette)
-        # modulation: LFOs (and, later, MIDI/OSC) that can drive any knob —
-        # merged with the audio bands into one signal table each frame.
+        # modulation: LFOs (and MIDI) that can drive any knob — merged with the
+        # audio bands into one signal table each frame.
         self.mods = ModEngine()
+        self.midi = MidiEngine()      # optional hardware controllers (CC -> drive)
         self._shapes_np = np.zeros((shapelib.MAX_SHAPES, shapelib.NF), np.float32)
         self._shapes_count = 0
         # per-shape "show a different effect": name->class catalog + the live
@@ -268,6 +274,7 @@ class Engine:
         self.effect = effect
         self.effect_error = getattr(effect, "error", "")
         self._clear_canvas()
+        self.feedback.clear()        # don't carry the old effect's echoes over
         self._start = time.perf_counter()
         self.effect_version += 1
         return True
@@ -315,6 +322,7 @@ class Engine:
             "params": self.store.to_dict(),
             "shape_fx": fx,
             "mods": self.mods.to_dict(),
+            "midi": self.midi.to_dict(),
             "layers": layers,
         }
 
@@ -327,6 +335,7 @@ class Engine:
             self.store.load_dict(data.get("params") or {})
             self._upload_palette(force=True)
         self.mods.load_dict(data.get("mods"))
+        self.midi.load_dict(data.get("midi"))
         # rebuild the per-shape effect knob caches so reconcile restores them
         cache = {}
         for entry in data.get("shape_fx") or []:
@@ -654,6 +663,7 @@ class Engine:
                 if self.effect:
                     self.effect.reset()
                 self._clear_canvas()
+                self.feedback.clear()
             if self._pending_export is not None:
                 cfg = self._pending_export
                 self._pending_export = None
@@ -667,9 +677,10 @@ class Engine:
 
             feats = self.audio.features() if self.audio else None
             self.ctx.audio = feats
-            # one signal table per frame: audio bands + LFOs, the drivers any
-            # knob can bind to (see ModEngine.signals).
+            # one signal table per frame: audio bands + LFOs + MIDI, the drivers
+            # any knob can bind to (see ModEngine.signals / MidiEngine.values).
             signals = self.mods.signals(self.ctx.time, feats)
+            signals.update(self.midi.values())
             self.ctx.p = self._resolve(signals)
             self._upload_palette()
 
@@ -692,6 +703,7 @@ class Engine:
                         self.effect_error = f"{type(e).__name__}: {e}"
                 self.postfx.apply(self.ctx.p, self.ctx.time)
                 self._render_and_blend_layers(feats, signals)  # stack over main fx
+                self._apply_feedback()                          # tunnels / spirals / echoes
                 self._composite_media()
                 if self._fx_active:        # shapes showing other effects -> draw them
                     self._render_secondary(feats, signals)
@@ -721,6 +733,7 @@ class Engine:
         self.running = False
         if self.audio:
             self.audio.stop()
+        self.midi.close()
 
     def _update_media(self):
         """Upload the latest media frame and update the camera-motion field, so
@@ -753,6 +766,17 @@ class Engine:
         self.shapes_fx.run(self.ctx.time,
                            float(self.ctx.p.get("shapes_gain", 1.0)),
                            self.ctx.audio)
+
+    def _apply_feedback(self):
+        """Recursively blend the previous composited frame back in (zoom/spin +
+        decay) for tunnels / spirals / echoes. Cheap no-op when off."""
+        p = self.ctx.p
+        if not p.get("feedback"):
+            return
+        self.feedback.apply(float(p.get("fb_zoom", 1.0)),
+                            math.radians(float(p.get("fb_rotate", 0.0))),
+                            float(p.get("fb_decay", 0.85)))
+        self.feedback.save()      # this frame becomes next frame's feedback source
 
     def _composite_media(self):
         """OPTIONAL 'Background' mode: blend the media behind/over the effect.

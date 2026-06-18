@@ -71,7 +71,8 @@ In the panels you can:
 - Choose an **audio source**: System (whatever's playing on your PC), Mic,
   a music **File**, or Off.
 - Tweak the effect's own knobs (speed, size, swirl, …).
-- Set the **look**: trails, fluid blur, grain, flicker, fade-in, brightness.
+- Set the **look**: trails, fluid blur, grain, flicker, fade-in, brightness,
+  and **feedback** (tunnels / spirals — see below).
 - Pick **colors**: a named palette, or 2+ custom colors for your own gradient.
 - **Drive any knob with a signal** — next to each slider, set `drive:` to an
   audio band (Bass / Mid / Treble / Vol / Beat, or the drum-tuned **Kick /
@@ -92,9 +93,21 @@ drives a parameter off a slow pulse, a sharp square, or random steps instead of
 (or as well as) the music. Set a square LFO on a color knob for a strobing
 palette, a slow sine on zoom for a breathing image — no audio required.
 
-This is the **routing spine**: audio bands and LFOs are one unified signal
-table, and future inputs (MIDI, OSC, Ableton Link) join the same menu. LFO
-settings are saved in your project/session.
+This is the **routing spine**: audio bands, LFOs **and MIDI** are one unified
+signal table, so they all share the exact same "drive" menu (future inputs like
+OSC / Ableton Link will join it too). LFO settings are saved in your
+project/session.
+
+### MIDI control
+
+Open the **🎹 MIDI** panel (Panels menu), pick your controller's **Port** and
+**Connect**. Each of **MIDI 1–8** can track one knob/fader: click **Learn**, then
+wiggle a control and it's captured (its CC + live value show in the row). Those
+slots appear in *every knob's* `drive:` menu as **MIDI 1–8**, so a hardware fader
+can ride brightness, a knob can sweep the swirl — hands-on, no AI. Mappings (and
+the port) are saved with your project. MIDI needs `mido` + `python-rtmidi`
+(`pip install mido python-rtmidi`); without them the panel says so and the rest
+of the app is unaffected.
 
 ### Layers — stack & blend effects
 
@@ -111,6 +124,20 @@ Photoshop layers. Each layer is a **full effect with its own knobs**:
 The main effect is always the bottom of the stack, so a single-effect setup is
 unchanged until you add a layer. The whole stack (each layer's effect, blend,
 opacity and knobs) is saved in your project/session.
+
+### Feedback — tunnels, spirals & echoes
+
+Flip on **feedback** (in the look knobs) to feed the **previous frame** back into
+the current one, transformed and decayed — the classic infinite-tunnel look:
+
+- **fb_zoom** — `>1` tunnels outward, `<1` sucks inward, `1.0` holds.
+- **fb_rotate** — spins the echo each step, turning tunnels into **spirals**.
+- **fb_decay** — how long echoes persist (too high blooms to white).
+
+It runs as a post-pass on the final frame, so it works on **any** effect (not
+just additive ones). And because these are ordinary knobs, they're **drivable** —
+put **fb_zoom on the bass** and the tunnel pumps with the kick. The buffer resets
+when you switch effects or hit Reset.
 
 ### Camera / image / video — as the *material* the effects act on
 
@@ -234,7 +261,9 @@ vizstudio/
   color.py      palette specs -> a 256-entry RGB lookup table the GPU samples
   audio.py      capture (system/mic/file) -> FFT -> bass/mid/treble/volume/beat
   media.py      camera / image / video input -> a frame the engine composites
-  postfx.py     global look: trails, fluid blur, grain, flicker, fade, brightness
+  midi.py       MIDI input (optional): maps controllers to the MIDI 1-8 drivers
+  postfx.py     global look: trails, fluid, grain, flicker, fade, brightness +
+                Feedback (recursive frame feedback: tunnels / spirals / echoes)
   engine.py     owns canvas + colors + audio + media + post-FX, runs the loop;
                 Presenter packs each frame to a display-ready uint8 image on GPU
   export.py     offline frame-accurate MP4 render, audio muxed via ffmpeg
@@ -244,8 +273,8 @@ vizstudio/
   shapes.py     shape "elements" metadata + numeric encoding (mode/shape/react)
   shapes_fx.py  ShapesCompositor: draws shapes as a layer that masks/warps/tints
                 the active effect (reveal / hide / warp / tint / glow)
-  modulation.py LFOs + the unified signal table (audio bands + LFOs) any knob
-                can be driven by — the routing spine for all inputs
+  modulation.py LFOs + the unified signal table (audio bands + LFOs + MIDI) any
+                knob can be driven by — the routing spine for all inputs
   layers_fx.py  LayerCompositor: blends a stack of effects over the main effect
                 (Normal / Add / Screen / Multiply / Lighten / Difference)
   builder_templates.py   the .py templates the Create Effect window writes

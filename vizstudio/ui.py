@@ -31,13 +31,15 @@ from . import shapes
 from . import project
 from .modulation import LFO_IDS, LFO_LABELS, LFO_SHAPES, N_LFOS
 from .layers_fx import LAYER_BLENDS, MAX_LAYERS
+from .midi import MIDI_IDS, MIDI_LABELS, N_MIDI
 
 _DRIVE_LABELS = {"none": "—", "volume": "Vol", "bass": "Bass",
                  "mid": "Mid", "treble": "Treble", "beat": "Beat",
                  "kick": "Kick", "snare": "Snare", "hihat": "HiHat"}
 _DRIVE_LABELS.update(LFO_LABELS)
-# every numeric knob's "drive" menu offers all of these: audio bands + LFOs
-DRIVE_SOURCES = list(AUDIO_SOURCES) + list(LFO_IDS)
+_DRIVE_LABELS.update(MIDI_LABELS)
+# every numeric knob's "drive" menu offers all of these: audio bands + LFOs + MIDI
+DRIVE_SOURCES = list(AUDIO_SOURCES) + list(LFO_IDS) + list(MIDI_IDS)
 
 # UI color themes. Keys: bg (window), panel (boxes), fg (text), accent
 # (highlights), btn (buttons), entry/entry_fg (text inputs).
@@ -193,6 +195,8 @@ class ControlPanel:
                  side="left",  floating=False, visible=True,  stretch="never",  minsize=140),
             dict(key="mod",    title="🎛 Modulation (LFOs)", builder=self._build_mod_panel,
                  side="left",  floating=False, visible=True,  stretch="never",  minsize=120),
+            dict(key="midi",   title="🎹 MIDI",          builder=self._build_midi_panel,
+                 side="left",  floating=False, visible=False, stretch="never",  minsize=120),
             dict(key="media",  title="Media",          builder=self._build_media_section,
                  side="left",  floating=False, visible=True,  stretch="never",  minsize=110),
             dict(key="shapes", title="✨ Shapes (elements)", builder=self._build_shapes_panel,
@@ -446,6 +450,95 @@ class ControlPanel:
         sc.pack(side="left", fill="x", expand=True)
         sc.set(cfg["depth"])
 
+    # ---- MIDI panel: hardware controllers -> drive sources --------------
+    def _build_midi_panel(self, parent):
+        """Connect a MIDI controller; map up to 8 of its knobs/faders to the
+        MIDI 1–8 drive sources (which then appear in every knob's drive menu)."""
+        self._midi_rows = []
+        if not self.engine.midi.available():
+            tk.Label(parent, text="MIDI unavailable. Install it with:\n\n    pip "
+                     "install mido python-rtmidi\n\nthen reopen Eyenips — your "
+                     "controller's knobs become MIDI 1–8 in every 'drive' menu.",
+                     fg="#888", justify="left", wraplength=360,
+                     padx=8, pady=8).pack(anchor="w")
+            return
+
+        top = tk.Frame(parent, padx=8, pady=4); top.pack(side="top", fill="x")
+        tk.Label(top, text="Port").pack(side="left")
+        self.midi_port = tk.StringVar(value=self.engine.midi._port_name or "")
+        self.midi_port_cb = ttk.Combobox(top, textvariable=self.midi_port, width=18,
+                                         state="readonly", values=self.engine.midi.ports())
+        self.midi_port_cb.pack(side="left", padx=3)
+        tk.Button(top, text="⟳", width=2, command=self._refresh_midi_ports).pack(side="left")
+        tk.Button(top, text="Connect", command=self._midi_connect).pack(side="left", padx=3)
+        self.midi_status = tk.Label(parent, text=self.engine.midi.status, fg="#888",
+                                    padx=8, anchor="w")
+        self.midi_status.pack(side="top", fill="x")
+        tk.Label(parent, text="Click Learn, then wiggle a knob to bind it. Each "
+                 "slot is MIDI 1–8 in every 'drive' menu.", fg="#888",
+                 wraplength=360, justify="left", padx=8).pack(side="top", anchor="w")
+
+        rows = tk.Frame(parent, padx=6); rows.pack(side="top", fill="x")
+        for i in range(N_MIDI):
+            r = tk.Frame(rows); r.pack(fill="x", pady=1)
+            tk.Label(r, text=f"MIDI {i + 1}", width=7, anchor="w").pack(side="left")
+            info = tk.Label(r, text="—", width=16, anchor="w", fg="#888")
+            info.pack(side="left")
+            tk.Button(r, text="Learn", width=6,
+                      command=lambda idx=i: self._midi_learn(idx)).pack(side="left", padx=2)
+            tk.Button(r, text="✕", width=2,
+                      command=lambda idx=i: (self.engine.midi.clear_slot(idx),
+                                             self._refresh_midi())).pack(side="left")
+            self._midi_rows.append(info)
+        self._refresh_midi()
+
+    def _refresh_midi_ports(self):
+        if hasattr(self, "midi_port_cb"):
+            self.midi_port_cb.config(values=self.engine.midi.ports())
+
+    def _midi_connect(self):
+        ok = self.engine.midi.open(self.midi_port.get())
+        self._set_status("MIDI connected" if ok else "MIDI connect failed", error=not ok)
+        if hasattr(self, "midi_status"):
+            self.midi_status.config(text=self.engine.midi.status)
+
+    def _midi_learn(self, slot):
+        self.engine.midi.learn(slot)
+        self._refresh_midi()
+
+    def _refresh_midi(self):
+        """Update the 8 slot read-outs (assigned CC + live value / 'learning')."""
+        rows = getattr(self, "_midi_rows", None)
+        if not rows:
+            return
+        for i, lbl in enumerate(rows):
+            info = self.engine.midi.slot_info(i)
+            try:
+                if info["learning"]:
+                    lbl.config(text="move a control…", fg="#06c")
+                elif info["cc"] is None:
+                    lbl.config(text="(unassigned)", fg="#888")
+                else:
+                    bar = "█" * int(info["value"] * 8)
+                    lbl.config(text=f"CC {info['cc']:>3}  {info['value']:.2f} {bar}",
+                               fg=(self._theme or {}).get("fg", "#888"))
+            except tk.TclError:
+                pass
+
+    def _load_midi(self, data):
+        """After a project load: reflect restored slot mappings; reconnect the
+        remembered port if it's still present."""
+        if not self.engine.midi.available():
+            return
+        name = (data or {}).get("port")
+        if name and name in self.engine.midi.ports():
+            self.engine.midi.open(name)
+        if hasattr(self, "midi_port"):
+            self.midi_port.set(self.engine.midi._port_name or "")
+        if hasattr(self, "midi_status"):
+            self.midi_status.config(text=self.engine.midi.status)
+        self._refresh_midi()
+
     def _build_params_panel(self, parent):
         self.param_host = tk.Frame(parent)
         self.param_host.pack(fill="both", expand=True, padx=4, pady=4)
@@ -689,6 +782,9 @@ class ControlPanel:
                     self.audio_status.config(text=self.engine.audio.status)
                 if self.engine.media and hasattr(self, "media_status"):
                     self.media_status.config(text=self.engine.media.status)
+            # live MIDI read-outs (assigned CC + value / learning) when shown
+            if self._pump_count % 6 == 0 and getattr(self, "_midi_rows", None):
+                self._refresh_midi()
             # coalesce changes into undo steps (~twice a second)
             if self._pump_count % 30 == 0:
                 self._maybe_snapshot()
@@ -1074,6 +1170,7 @@ class ControlPanel:
         self._build_params()                       # reflect loaded primary knobs
         self._load_shapes(data.get("shapes") or [])
         self._load_layers(data.get("layers") or [])
+        self._load_midi(data.get("midi") or {})
         self._apply_audio(data.get("audio") or {})
         self._apply_media(data.get("media") or {})
         if with_layout and data.get("layout"):

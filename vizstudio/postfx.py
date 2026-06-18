@@ -32,6 +32,17 @@ def global_params():
                help="Ramp up from black when the effect starts."),
         Slider("brightness", 0.1, 3.0, default=1.0, audio=True,
                help="Master brightness."),
+        Toggle("feedback", default=False,
+               help="Feed the previous frame back in, zoomed/spun — infinite "
+                    "tunnels, spirals and echoes. Drive zoom on the bass!"),
+        Slider("fb_decay", 0.0, 0.98, default=0.85, audio=True,
+               help="How strongly the previous frame persists. Higher = longer, "
+                    "brighter echoes (too high can bloom to white)."),
+        Slider("fb_zoom", 0.80, 1.25, default=1.02, audio=True,
+               help="Scale the fed-back frame each step. >1 tunnels outward, "
+                    "<1 sucks inward, 1.0 holds."),
+        Slider("fb_rotate", -8.0, 8.0, default=0.0, audio=True,
+               help="Spin the fed-back frame each step (degrees) — spirals."),
     ]
 
 
@@ -91,3 +102,61 @@ class PostFX:
             mult *= min(1.0, elapsed / 2.0)  # 2-second ramp from black
         if abs(mult - 1.0) > 1e-3:
             self.scale(mult)
+
+
+@ti.data_oriented
+class Feedback:
+    """Frame feedback: blends the PREVIOUS composited frame back into this one,
+    transformed (zoom + rotate around the center) and decayed. That recursion is
+    what makes the classic infinite-tunnel / spiral / echo looks. It runs as a
+    post-pass on the final canvas (not by relying on an effect leaving pixels
+    untouched), so it works on ANY effect, including overwriting ones."""
+
+    def __init__(self, width, height, canvas):
+        self.w = width
+        self.h = height
+        self.canvas = canvas
+        self.prev = ti.Vector.field(3, ti.f32, shape=(width, height))
+
+    @ti.func
+    def _sample(self, u, v):
+        """Bilinear sample of the previous frame at normalized (u, v); anything
+        outside [0,1] reads as black so the tunnel fades into darkness."""
+        out = ti.Vector([0.0, 0.0, 0.0])
+        if 0.0 <= u <= 1.0 and 0.0 <= v <= 1.0:
+            fx = u * (self.w - 1)
+            fy = v * (self.h - 1)
+            x0 = ti.cast(ti.floor(fx), ti.i32)
+            y0 = ti.cast(ti.floor(fy), ti.i32)
+            ax = fx - x0
+            ay = fy - y0
+            x1 = ti.min(self.w - 1, x0 + 1)
+            y1 = ti.min(self.h - 1, y0 + 1)
+            a = self.prev[x0, y0] * (1 - ax) + self.prev[x1, y0] * ax
+            b = self.prev[x0, y1] * (1 - ax) + self.prev[x1, y1] * ax
+            out = a * (1 - ay) + b * ay
+        return out
+
+    @ti.kernel
+    def apply(self, zoom: ti.f32, angle: ti.f32, decay: ti.f32):
+        ca = ti.cos(angle)
+        sa = ti.sin(angle)
+        inv = 1.0 / ti.max(zoom, 1e-3)
+        for i, j in self.canvas:
+            du = i / (self.w - 1) - 0.5      # output pixel offset from center
+            dv = j / (self.h - 1) - 0.5
+            # sample the previous frame at the inverse transform (rotate -angle,
+            # shrink by 1/zoom) so zoom>1 pushes content outward (a tunnel).
+            su = (ca * du + sa * dv) * inv + 0.5
+            sv = (-sa * du + ca * dv) * inv + 0.5
+            self.canvas[i, j] += self._sample(su, sv) * decay
+
+    @ti.kernel
+    def save(self):
+        for i, j in self.canvas:
+            self.prev[i, j] = self.canvas[i, j]
+
+    @ti.kernel
+    def clear(self):
+        for i, j in self.prev:
+            self.prev[i, j] = ti.Vector([0.0, 0.0, 0.0])
