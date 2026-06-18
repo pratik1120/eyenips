@@ -457,7 +457,7 @@ class ControlPanel:
         self._midi_rows = []
         if not self.engine.midi.available():
             tk.Label(parent, text="MIDI unavailable. Install it with:\n\n    pip "
-                     "install mido python-rtmidi\n\nthen reopen Eyenips — your "
+                     "install mido pygame\n\nthen reopen Eyenips — your "
                      "controller's knobs become MIDI 1–8 in every 'drive' menu.",
                      fg="#888", justify="left", wraplength=360,
                      padx=8, pady=8).pack(anchor="w")

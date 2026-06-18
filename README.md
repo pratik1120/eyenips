@@ -105,9 +105,9 @@ Open the **🎹 MIDI** panel (Panels menu), pick your controller's **Port** and
 wiggle a control and it's captured (its CC + live value show in the row). Those
 slots appear in *every knob's* `drive:` menu as **MIDI 1–8**, so a hardware fader
 can ride brightness, a knob can sweep the swirl — hands-on, no AI. Mappings (and
-the port) are saved with your project. MIDI needs `mido` + `python-rtmidi`
-(`pip install mido python-rtmidi`); without them the panel says so and the rest
-of the app is unaffected.
+the port) are saved with your project. MIDI needs `mido` + a backend
+(`pip install mido pygame`); without them the panel says so and the rest of the
+app is unaffected.
 
 ### Layers — stack & blend effects
 

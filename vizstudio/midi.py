@@ -3,9 +3,10 @@
 A hardware knob or fader is just another driver. Each of the 8 MIDI slots tracks
 one CC controller (value 0..127 -> 0..1) and shows up in every knob's 'drive'
 menu as MIDI 1..8 — exactly like an LFO or an audio band, because they all flow
-through the same signal table (see ModEngine). Uses `mido` (+ `python-rtmidi`)
-if installed; without them the MIDI panel shows 'unavailable' and the rest of the
-app runs untouched.
+through the same signal table (see ModEngine). Uses `mido` with whatever backend
+loads — `python-rtmidi` if available, else `pygame` (PortMidi, which has wheels
+everywhere); without any backend the MIDI panel shows 'unavailable' and the rest
+of the app runs untouched.
 
 Assign a slot to a controller with **Learn**: click Learn, wiggle the knob, and
 the next CC that arrives is captured into that slot.
@@ -14,16 +15,46 @@ the next CC that arrives is captured into that slot.
 from __future__ import annotations
 
 import threading
+import time
 
 N_MIDI = 8
 MIDI_IDS = [f"midi{i + 1}" for i in range(N_MIDI)]
 MIDI_LABELS = {f"midi{i + 1}": f"MIDI {i + 1}" for i in range(N_MIDI)}
 
+# mido needs a backend to reach hardware. python-rtmidi is best (low latency)
+# but has no prebuilt wheel on some Pythons; pygame ships PortMidi and wheels
+# everywhere, so we fall back to it. We pick the first that actually loads.
+_BACKENDS = ["mido.backends.rtmidi", "mido.backends.pygame", "mido.backends.portmidi"]
+_mido = None          # cached working module, or None
+_mido_probed = False
+
+
+def _get_mido():
+    """The mido module with a backend that actually loads on this machine, or
+    None. Probed once and cached (switching backends mid-run is messy)."""
+    global _mido, _mido_probed
+    if _mido_probed:
+        return _mido
+    _mido_probed = True
+    try:
+        import mido
+    except Exception:
+        return None
+    for be in _BACKENDS:
+        try:
+            mido.set_backend(be, load=True)
+            mido.get_input_names()          # probe: backend loads + can enumerate
+            _mido = mido
+            return _mido
+        except Exception:
+            continue
+    return None
+
 
 class MidiEngine:
     """Owns the (optional) input port and maps 8 slots to CC controllers.
 
-    Thread-safe: rtmidi delivers messages on its own thread (via a callback),
+    Thread-safe: a small poll thread drains the port (works with any backend),
     the UI edits slots, and the render loop reads `values()` each frame.
     """
 
@@ -34,42 +65,49 @@ class MidiEngine:
         self._learn = -1                 # slot awaiting the next CC, or -1
         self._port = None
         self._port_name = None
+        self._stop = threading.Event()
+        self._thread = None
         self.status = "off"
 
     # ---- availability / ports ------------------------------------------
     def available(self):
-        try:
-            import mido  # noqa: F401
-            return True
-        except Exception:
-            return False
+        return _get_mido() is not None
 
     def ports(self):
+        mido = _get_mido()
+        if mido is None:
+            return []
         try:
-            import mido
             return list(mido.get_input_names())
         except Exception:
             return []
 
     # ---- connection ----------------------------------------------------
     def open(self, name):
-        """Open `name` and stream its CC messages into the slots. mido calls our
-        callback on rtmidi's own thread, so there's no loop to manage."""
+        """Open `name` and poll its CC messages into the slots. Polling (rather
+        than a callback) works across every mido backend, not just rtmidi."""
         self.close()
-        if not name:
+        mido = _get_mido()
+        if mido is None or not name:
             return False
         try:
-            import mido
-            self._port = mido.open_input(name, callback=self._cb)
+            self._port = mido.open_input(name)
         except Exception as e:
             self.status = f"error: {type(e).__name__}"
             self._port = None
             return False
         self._port_name = name
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
         self.status = f"on · {name}"
         return True
 
     def close(self):
+        self._stop.set()
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self._thread = None
         if self._port is not None:
             try:
                 self._port.close()
@@ -80,6 +118,19 @@ class MidiEngine:
 
     def is_open(self):
         return self._port is not None
+
+    def _run(self):
+        """Drain pending messages a few hundred times a second."""
+        while not self._stop.is_set():
+            port = self._port
+            if port is None:
+                break
+            try:
+                for msg in port.iter_pending():
+                    self._cb(msg)
+            except Exception:
+                break
+            time.sleep(0.003)
 
     def _cb(self, msg):
         if getattr(msg, "type", None) == "control_change":

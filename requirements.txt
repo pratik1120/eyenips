@@ -9,4 +9,5 @@ imageio-ffmpeg>=0.5  # bundles the ffmpeg binary used for MP4 export
 pillow>=9.0          # draws the live visual inside the app window
 opencv-python>=4.5   # camera / image / video input (optional; media stays off without it)
 mido>=1.3            # MIDI input (optional; the MIDI panel stays "unavailable" without it)
-python-rtmidi>=1.5   # backend mido uses to talk to MIDI hardware
+pygame>=2.6          # MIDI backend (PortMidi) — prebuilt wheels everywhere, no compiler
+# python-rtmidi      # optional lower-latency MIDI backend; needs a C++ toolchain to build
