@@ -22,6 +22,8 @@ from .params import Slider, ColorPalette
 from .postfx import PostFX, global_params
 from .media import media_params, BLEND_IDS
 from .shapes_fx import ShapesCompositor
+from .modulation import ModEngine
+from .layers_fx import LayerCompositor, LAYER_BLEND_IDS, MAX_LAYERS
 
 
 class ParamStore:
@@ -188,6 +190,9 @@ class Engine:
                                         self.motion_field, self._prev_luma)
         # shapes are a LAYER over the active effect (mask / warp / tint / overlay)
         self.shapes_fx = ShapesCompositor(self.canvas, self.palette)
+        # modulation: LFOs (and, later, MIDI/OSC) that can drive any knob —
+        # merged with the audio bands into one signal table each frame.
+        self.mods = ModEngine()
         self._shapes_np = np.zeros((shapelib.MAX_SHAPES, shapelib.NF), np.float32)
         self._shapes_count = 0
         # per-shape "show a different effect": name->class catalog + the live
@@ -202,6 +207,19 @@ class Engine:
                         for _ in range(shapelib.MAX_FX_SLOTS)]
         # remember each shape-effect's knob values across slot renumbering
         self._fx_store_cache = {}     # (shape_id, effect_name) -> ParamStore
+        # --- layer stack: extra effects blended ON TOP of the main effect ---
+        # each layer is a full effect rendered into its own buffer, then blended
+        # onto the canvas (mode + opacity). Mirrors the secondary-effect setup.
+        self.layer_fx = LayerCompositor(self.canvas)
+        self._layer_bufs = [ti.Vector.field(3, ti.f32, shape=(width, height))
+                            for _ in range(MAX_LAYERS)]
+        self._layer_pals = [ti.Vector.field(3, ti.f32, shape=256)
+                            for _ in range(MAX_LAYERS)]
+        self._layers_meta = []        # live list: dict(id, effect, blend, opacity, visible)
+        self._layers_active = []      # built layer slots (dicts), bottom -> top
+        self._layers_key = None       # structural key -> when to rebuild
+        self._layers_dirty = False
+        self._layer_store_cache = {}  # (layer_id, effect_name) -> ParamStore
         self.ctx = Context(width, height, self.canvas, self.palette)
         # media fields are stable refs effects can sample any time
         self.ctx.media = self.media_field
@@ -283,10 +301,21 @@ class Engine:
         for (sid, name), store in self._fx_store_cache.items():
             d = store.to_dict(); d["id"] = sid; d["effect"] = name
             fx.append(d)
+        layers = []
+        for m in self._layers_meta:
+            d = dict(id=m.get("id"), effect=m.get("effect"),
+                     blend=m.get("blend", "Normal"), opacity=m.get("opacity", 1.0),
+                     visible=m.get("visible", True))
+            store = self._layer_store_cache.get((m.get("id"), m.get("effect")))
+            if store is not None:
+                d["params"] = store.to_dict()
+            layers.append(d)
         return {
             "effect": self.effect.name if self.effect else None,
             "params": self.store.to_dict(),
             "shape_fx": fx,
+            "mods": self.mods.to_dict(),
+            "layers": layers,
         }
 
     def import_state(self, data):
@@ -297,6 +326,7 @@ class Engine:
         if cls is not None and self.set_effect(cls()):
             self.store.load_dict(data.get("params") or {})
             self._upload_palette(force=True)
+        self.mods.load_dict(data.get("mods"))
         # rebuild the per-shape effect knob caches so reconcile restores them
         cache = {}
         for entry in data.get("shape_fx") or []:
@@ -313,6 +343,27 @@ class Engine:
         self._fx_wanted = {}        # force reconcile to rebuild instances
         self._fx_active = {}
         self._fx_dirty = True
+        # restore the layer stack (each layer's effect + its own knobs)
+        lcache = {}
+        meta = []
+        for entry in data.get("layers") or []:
+            lid, ename = entry.get("id"), entry.get("effect")
+            ecls = self.effect_catalog.get(ename)
+            if ecls is None:
+                continue
+            inst = ecls()
+            store = ParamStore()
+            store.load(global_params() + list(inst.params))
+            store.load_dict(entry.get("params") or {})
+            lcache[(lid, ename)] = store
+            meta.append(dict(id=lid, effect=ename, blend=entry.get("blend", "Normal"),
+                             opacity=entry.get("opacity", 1.0),
+                             visible=entry.get("visible", True)))
+        self._layer_store_cache = lcache
+        self._layers_meta = meta
+        self._layers_active = []
+        self._layers_key = None     # force reconcile to rebuild instances
+        self._layers_dirty = True
 
     def request_shapes(self, shape_dicts):
         """Set the shapes overlay (drawn on top of whatever effect is active).
@@ -374,21 +425,24 @@ class Engine:
             self._last_palette = key
 
     # ---- per-frame param resolution ------------------------------------
-    def _resolve_store(self, store, feats):
+    def _resolve_store(self, store, signals):
+        """Resolve a store's knob values for this frame, applying each driven
+        knob's modulation. `signals` is the unified {source: value} table (audio
+        bands + LFOs), so a knob can be driven by the kick OR by LFO 2 alike."""
         values, srcs, amts = store.snapshot()
         out = {}
         for name, val in values.items():
             p = store.params.get(name)
-            if isinstance(p, Slider) and feats is not None:
+            if isinstance(p, Slider) and signals is not None:
                 src = srcs.get(name, "none")
                 if src != "none":
-                    drive = feats.get(src) * (p.hi - p.lo) * amts.get(name, 0.5)
+                    drive = signals.get(src, 0.0) * (p.hi - p.lo) * amts.get(name, 0.5)
                     val = max(p.lo, min(p.hi, val + drive))
             out[name] = val
         return out
 
-    def _resolve(self, feats):
-        return self._resolve_store(self.store, feats)
+    def _resolve(self, signals):
+        return self._resolve_store(self.store, signals)
 
     # ---- secondary effects (shapes showing a different effect) ----------
     def _reconcile_secondary(self):
@@ -449,7 +503,7 @@ class Engine:
             d["pal"].from_numpy(color.build_lut(spec).astype(np.float32))
             d["palkey"] = key
 
-    def _render_secondary(self, feats):
+    def _render_secondary(self, feats, signals):
         """Render each secondary effect (its own knobs + look post-FX + palette)
         into its buffer so window-shapes can sample it."""
         for d in self._fx_active.values():
@@ -458,7 +512,7 @@ class Engine:
             c.time = self.ctx.time; c.dt = self.ctx.dt; c.frame = self.ctx.frame
             c.audio = feats
             c.has_media = self.ctx.has_media
-            c.p = self._resolve_store(d["store"], feats)
+            c.p = self._resolve_store(d["store"], signals)
             if c.p.get("trails"):
                 d["postfx"].decay(float(c.p.get("trail_length", 0.9)))
             else:
@@ -468,6 +522,105 @@ class Engine:
                 d["postfx"].apply(c.p, c.time)
             except Exception as e:
                 self.effect_error = f"shape effect '{d['name']}': {type(e).__name__}: {e}"
+
+    # ---- layer stack (effects blended over the main effect) -------------
+    def request_layers(self, layers):
+        """Set the layer stack (bottom -> top), each: dict(id, effect, blend,
+        opacity, visible). Cheap: swaps the live meta list and only flags a
+        rebuild when the set of (id, effect) actually changes, so dragging an
+        opacity slider doesn't re-instantiate anything."""
+        layers = [l for l in (layers or []) if l.get("effect")][:MAX_LAYERS]
+        self._layers_meta = layers          # atomic ref swap (read on render thread)
+        key = tuple((l.get("id"), l.get("effect")) for l in layers)
+        if key != self._layers_key:
+            self._layers_key = key
+            self._layers_dirty = True
+
+    def layer_fx_for(self, layer_id):
+        """The live layer slot for an id (or None) — the Layer FX editor reads
+        its store + params from here."""
+        for d in self._layers_active:
+            if d["id"] == layer_id:
+                return d
+        return None
+
+    def _reconcile_layers(self):
+        """Make self._layers_active match the current meta: build new layer
+        effect instances (each a full effect with its own params/look/palette),
+        reuse unchanged ones, drop the rest. Runs on the render thread."""
+        self._layers_dirty = False
+        by_key = {(d["id"], d["name"]): d for d in self._layers_active}
+        new_active = []
+        used_bufs = 0
+        for m in self._layers_meta:
+            lid, name = m.get("id"), m.get("effect")
+            cur = by_key.get((lid, name))
+            if cur is not None:
+                new_active.append(cur)          # reuse — same layer+effect
+                used_bufs += 1
+                continue
+            cls = self.effect_catalog.get(name)
+            if cls is None or used_bufs >= MAX_LAYERS:
+                continue
+            buf = self._layer_bufs[used_bufs]
+            pal = self._layer_pals[used_bufs]
+            inst = cls()
+            params = global_params() + list(inst.params)
+            key = (lid, name)
+            store = self._layer_store_cache.get(key)
+            if store is None:
+                store = ParamStore(); store.load(params)
+                self._layer_store_cache[key] = store
+            ctx = Context(self.w, self.h, buf, pal)
+            ctx.media = self.media_field
+            ctx.media_motion = self.motion_field
+            try:
+                inst.setup(ctx)
+            except Exception as e:
+                self.effect_error = f"layer '{name}': {type(e).__name__}: {e}"
+                continue
+            new_active.append(dict(id=lid, name=name, inst=inst, ctx=ctx, store=store,
+                                   params=params, buf=buf, pal=pal,
+                                   postfx=PostFX(self.w, self.h, buf), palkey=None))
+            used_bufs += 1
+        # clear buffers no longer backed by a layer (avoid stale art)
+        for k in range(len(new_active), MAX_LAYERS):
+            self._layer_bufs[k].fill(0)
+        # prune knob caches for layers that no longer exist
+        live = {(l.get("id"), l.get("effect")) for l in self._layers_meta}
+        self._layer_store_cache = {k: v for k, v in self._layer_store_cache.items()
+                                   if k in live}
+        self._layers_active = new_active
+
+    def _render_and_blend_layers(self, feats, signals):
+        """Render each layer (own knobs + look post-FX + palette) into its buffer
+        and blend it onto the canvas with its mode + opacity, bottom -> top."""
+        if not self._layers_active:
+            return
+        meta_by_id = {m.get("id"): m for m in self._layers_meta}
+        for d in self._layers_active:
+            m = meta_by_id.get(d["id"], {})
+            if not m.get("visible", True):
+                continue
+            self._upload_store_palette(d)
+            c = d["ctx"]
+            c.time = self.ctx.time; c.dt = self.ctx.dt; c.frame = self.ctx.frame
+            c.audio = feats
+            c.has_media = self.ctx.has_media
+            c.p = self._resolve_store(d["store"], signals)
+            if c.p.get("trails"):
+                d["postfx"].decay(float(c.p.get("trail_length", 0.9)))
+            else:
+                d["buf"].fill(0)
+            try:
+                d["inst"].render(c)
+                d["postfx"].apply(c.p, c.time)
+            except Exception as e:
+                self.effect_error = f"layer '{d['name']}': {type(e).__name__}: {e}"
+                continue
+            self.layer_fx.blend(d["buf"],
+                                LAYER_BLEND_IDS.get(m.get("blend", "Normal"), 0),
+                                float(m.get("opacity", 1.0)))
 
     # ---- main loop ------------------------------------------------------
     def run(self, on_frame=None, display=None, target_fps=60):
@@ -494,6 +647,8 @@ class Engine:
                 self._pending_shapes = False
             if self._fx_dirty:
                 self._reconcile_secondary()
+            if self._layers_dirty:
+                self._reconcile_layers()
             if self._pending_reset:
                 self._pending_reset = False
                 if self.effect:
@@ -512,7 +667,10 @@ class Engine:
 
             feats = self.audio.features() if self.audio else None
             self.ctx.audio = feats
-            self.ctx.p = self._resolve(feats)
+            # one signal table per frame: audio bands + LFOs, the drivers any
+            # knob can bind to (see ModEngine.signals).
+            signals = self.mods.signals(self.ctx.time, feats)
+            self.ctx.p = self._resolve(signals)
             self._upload_palette()
 
             if not self.paused:
@@ -533,9 +691,10 @@ class Engine:
                         # a user effect threw - report it, don't kill the app
                         self.effect_error = f"{type(e).__name__}: {e}"
                 self.postfx.apply(self.ctx.p, self.ctx.time)
+                self._render_and_blend_layers(feats, signals)  # stack over main fx
                 self._composite_media()
                 if self._fx_active:        # shapes showing other effects -> draw them
-                    self._render_secondary(feats)
+                    self._render_secondary(feats, signals)
                 self._composite_shapes()   # shapes interact with the final image
                 self.ctx.frame += 1
 

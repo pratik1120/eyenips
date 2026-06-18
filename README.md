@@ -73,13 +73,44 @@ In the panels you can:
 - Tweak the effect's own knobs (speed, size, swirl, …).
 - Set the **look**: trails, fluid blur, grain, flicker, fade-in, brightness.
 - Pick **colors**: a named palette, or 2+ custom colors for your own gradient.
-- **Drive any knob with the audio** — next to each slider, set `drive:` to
-  Bass / Mid / Treble / Vol / Beat, or the drum-tuned **Kick / Snare / Hi-hat**
-  bands, and dial the amount. e.g. particle size kicking on the kick drum. The
-  live meter shows all seven bands.
+- **Drive any knob with a signal** — next to each slider, set `drive:` to an
+  audio band (Bass / Mid / Treble / Vol / Beat, or the drum-tuned **Kick /
+  Snare / Hi-hat**) **or an LFO** (see below), and dial the amount. e.g.
+  particle size kicking on the kick drum, or swirl breathing on a slow sine.
+  The live meter shows all seven audio bands.
 
 If the audio libraries aren't installed or there's no device, the app still
 runs — audio just stays "off".
+
+### Modulation — make anything move, with or without sound
+
+The **🎛 Modulation (LFOs)** panel gives you four **LFOs** — free-running shapes
+(*sine, triangle, saw, ramp-down, square, random*) with a **Rate** (Hz) and
+**Depth**. They show up in *every knob's* `drive:` menu as **LFO 1–4**, right
+alongside the audio bands — so the exact same "route a source to a knob" gesture
+drives a parameter off a slow pulse, a sharp square, or random steps instead of
+(or as well as) the music. Set a square LFO on a color knob for a strobing
+palette, a slow sine on zoom for a breathing image — no audio required.
+
+This is the **routing spine**: audio bands and LFOs are one unified signal
+table, and future inputs (MIDI, OSC, Ableton Link) join the same menu. LFO
+settings are saved in your project/session.
+
+### Layers — stack & blend effects
+
+The **🧱 Layers** panel stacks extra effects *on top of* the main effect, like
+Photoshop layers. Each layer is a **full effect with its own knobs**:
+
+- Pick its **blend mode** — *Normal, Add, Screen, Multiply, Lighten,
+  Difference* — and its **opacity**, and toggle it on/off.
+- Hit **⚙** to open **Layer FX** and edit that layer's *complete* knobs (look,
+  grain, colors, and its own audio/LFO drive) — exactly like a normal effect.
+- Stack up to **4 layers** above the base. So run **Plasma**, **Screen** a
+  **Liquid Fractal** over it at 60%, then **Add** a third on the beat.
+
+The main effect is always the bottom of the stack, so a single-effect setup is
+unchanged until you add a layer. The whole stack (each layer's effect, blend,
+opacity and knobs) is saved in your project/session.
 
 ### Camera / image / video — as the *material* the effects act on
 
@@ -213,6 +244,10 @@ vizstudio/
   shapes.py     shape "elements" metadata + numeric encoding (mode/shape/react)
   shapes_fx.py  ShapesCompositor: draws shapes as a layer that masks/warps/tints
                 the active effect (reveal / hide / warp / tint / glow)
+  modulation.py LFOs + the unified signal table (audio bands + LFOs) any knob
+                can be driven by — the routing spine for all inputs
+  layers_fx.py  LayerCompositor: blends a stack of effects over the main effect
+                (Normal / Add / Screen / Multiply / Lighten / Difference)
   builder_templates.py   the .py templates the Create Effect window writes
   ui.py         control panel + the in-app Create Effect window
   registry.py   finds every Effect subclass defined in effects/

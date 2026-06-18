@@ -29,10 +29,15 @@ from .builder_templates import CODE_TEMPLATE, expression_file, EXPR_EFFECT_NAME
 from . import patterns
 from . import shapes
 from . import project
+from .modulation import LFO_IDS, LFO_LABELS, LFO_SHAPES, N_LFOS
+from .layers_fx import LAYER_BLENDS, MAX_LAYERS
 
 _DRIVE_LABELS = {"none": "—", "volume": "Vol", "bass": "Bass",
                  "mid": "Mid", "treble": "Treble", "beat": "Beat",
                  "kick": "Kick", "snare": "Snare", "hihat": "HiHat"}
+_DRIVE_LABELS.update(LFO_LABELS)
+# every numeric knob's "drive" menu offers all of these: audio bands + LFOs
+DRIVE_SOURCES = list(AUDIO_SOURCES) + list(LFO_IDS)
 
 # UI color themes. Keys: bg (window), panel (boxes), fg (text), accent
 # (highlights), btn (buttons), entry/entry_fg (text inputs).
@@ -186,19 +191,25 @@ class ControlPanel:
             # --- left dock: inputs + the shapes editor ---
             dict(key="audio",  title="Audio",          builder=self._build_audio_section,
                  side="left",  floating=False, visible=True,  stretch="never",  minsize=140),
+            dict(key="mod",    title="🎛 Modulation (LFOs)", builder=self._build_mod_panel,
+                 side="left",  floating=False, visible=True,  stretch="never",  minsize=120),
             dict(key="media",  title="Media",          builder=self._build_media_section,
                  side="left",  floating=False, visible=True,  stretch="never",  minsize=110),
             dict(key="shapes", title="✨ Shapes (elements)", builder=self._build_shapes_panel,
                  side="left",  floating=False, visible=True,  stretch="always", minsize=260),
-            # --- right dock: effect + its parameters + export ---
+            # --- right dock: effect + layers + parameters + export ---
             dict(key="effect", title="Effect",         builder=self._build_effect_picker,
                  side="right", floating=False, visible=True,  stretch="never",  minsize=64),
+            dict(key="layers", title="🧱 Layers",       builder=self._build_layers_panel,
+                 side="right", floating=False, visible=True,  stretch="never",  minsize=120),
             dict(key="params", title="Parameters",     builder=self._build_params_panel,
                  side="right", floating=False, visible=True,  stretch="always", minsize=180),
             dict(key="export", title="Export MP4",     builder=self._build_export_section,
                  side="right", floating=False, visible=True,  stretch="never",  minsize=90),
             # --- on-demand floating ---
             dict(key="shapefx", title="⚙ Shape FX", builder=self._build_shapefx_panel,
+                 side="right", floating=True,  visible=False, stretch="always", minsize=320),
+            dict(key="layerfx", title="⚙ Layer FX", builder=self._build_layerfx_panel,
                  side="right", floating=True,  visible=False, stretch="always", minsize=320),
             dict(key="create", title="✎ Create Effect", builder=self._build_create_panel,
                  side="right", floating=True,  visible=False, stretch="always", minsize=360),
@@ -386,11 +397,54 @@ class ControlPanel:
             if p["toplevel"] is not None:
                 p["toplevel"].destroy(); p["toplevel"] = None
         for p in self.panels:
-            p["floating"] = p["key"] in ("create", "shapefx")
-            p["visible"] = p["key"] not in ("create", "shapefx")
+            p["floating"] = p["key"] in ("create", "shapefx", "layerfx")
+            p["visible"] = p["key"] not in ("create", "shapefx", "layerfx")
             p["menu_var"].set(p["visible"])
         self._build_all_panels()
         self.apply_theme(self.theme_var.get())
+
+    # ---- modulation panel (LFOs) ---------------------------------------
+    def _build_mod_panel(self, parent):
+        """Editor for the LFOs. Route one to any knob via that knob's 'drive'
+        menu (the LFO 1–4 entries). Edits go straight to the engine's ModEngine,
+        which is read on the render thread — no rebuild, smooth while dragging."""
+        tk.Label(parent, text="Free-running shapes you can route to ANY knob: open "
+                 "a knob's 'drive' menu and pick LFO 1–4.", fg="#888",
+                 wraplength=360, justify="left").pack(anchor="w", padx=6, pady=(2, 4))
+        for i in range(N_LFOS):
+            self._build_lfo_row(parent, i)
+
+    def _build_lfo_row(self, parent, i):
+        cfg = self.engine.mods.get_lfo(i)
+        box = tk.LabelFrame(parent, text=f"LFO {i + 1}", padx=6, pady=2)
+        box.pack(fill="x", padx=6, pady=2)
+
+        r1 = tk.Frame(box); r1.pack(fill="x")
+        tk.Label(r1, text="Shape", width=6, anchor="w").pack(side="left")
+        shp = tk.StringVar(value=cfg["shape"])
+        cb = ttk.Combobox(r1, textvariable=shp, width=10, state="readonly",
+                          values=LFO_SHAPES)
+        cb.pack(side="left", padx=3)
+        cb.bind("<<ComboboxSelected>>",
+                lambda e, idx=i, v=shp: self.engine.mods.set_lfo(idx, shape=v.get()))
+
+        r2 = tk.Frame(box); r2.pack(fill="x")
+        tk.Label(r2, text="Rate", width=6, anchor="w").pack(side="left")
+        tk.Scale(r2, from_=0.01, to=10.0, resolution=0.01, orient="horizontal",
+                 length=180, showvalue=True,
+                 command=lambda v, idx=i: self.engine.mods.set_lfo(idx, rate=float(v))
+                 ).pack(side="left", fill="x", expand=True)
+        tk.Label(r2, text="Hz").pack(side="left")
+        # set initial position without firing the command's float() on a string
+        r2.winfo_children()[1].set(cfg["rate"])
+
+        r3 = tk.Frame(box); r3.pack(fill="x")
+        tk.Label(r3, text="Depth", width=6, anchor="w").pack(side="left")
+        sc = tk.Scale(r3, from_=0.0, to=1.0, resolution=0.01, orient="horizontal",
+                      length=180, showvalue=True,
+                      command=lambda v, idx=i: self.engine.mods.set_lfo(idx, depth=float(v)))
+        sc.pack(side="left", fill="x", expand=True)
+        sc.set(cfg["depth"])
 
     def _build_params_panel(self, parent):
         self.param_host = tk.Frame(parent)
@@ -867,6 +921,7 @@ class ControlPanel:
         btns = tk.Frame(box); btns.pack(fill="x", pady=(4, 0))
         tk.Button(btns, text="Reset effect", command=self._reset).pack(side="left")
         tk.Button(btns, text="✨ Shapes…", command=self._open_shapes).pack(side="left", padx=6)
+        tk.Button(btns, text="🧱 Layers…", command=self._open_layers).pack(side="left", padx=6)
         tk.Button(btns, text="✎ Create Effect…", command=self._goto_create).pack(side="left", padx=6)
 
     def _build_export_section(self, parent):
@@ -1018,6 +1073,7 @@ class ControlPanel:
             self.effect_var.set(self.engine.effect.name)
         self._build_params()                       # reflect loaded primary knobs
         self._load_shapes(data.get("shapes") or [])
+        self._load_layers(data.get("layers") or [])
         self._apply_audio(data.get("audio") or {})
         self._apply_media(data.get("media") or {})
         if with_layout and data.get("layout"):
@@ -1521,6 +1577,241 @@ class ControlPanel:
         sid = self.shape_sel.get() if getattr(self, "shape_sel", None) else ""
         return next((it for it in getattr(self, "shape_items", []) if it["id"] == sid), None)
 
+    # ---- Layers: effects stacked & blended over the main effect ----------
+    def _open_layers(self, *_a, **_k):
+        """Show the Layers panel; add a starter layer if empty."""
+        p = self._panel("layers")
+        self._set_visible(p, True)
+        if p["floating"] and p["toplevel"] is not None:
+            try:
+                p["toplevel"].deiconify(); p["toplevel"].lift()
+            except tk.TclError:
+                pass
+        if not getattr(self, "layer_items", None):
+            self._add_layer()
+
+    def _build_layers_panel(self, parent):
+        self.layer_items = []
+        self._layer_id = 0
+        self.layer_sel = tk.StringVar(value="")
+
+        head = tk.Frame(parent, padx=8, pady=4); head.pack(side="top", fill="x")
+        tk.Label(head, text="Stack extra effects ON TOP of the main effect. Each "
+                 "layer is a full effect with its own knobs — pick its blend mode "
+                 "and opacity, and ⚙ to edit it. The bottom row draws on top.",
+                 wraplength=360, justify="left", font=("", 9, "bold")).pack(anchor="w")
+
+        self.layers_status = tk.Label(parent, text="", fg="#888",
+                                      wraplength=360, justify="left")
+        self.layers_status.pack(side="bottom", anchor="w", padx=8, pady=(0, 4))
+        btns = tk.Frame(parent, padx=8, pady=4); btns.pack(side="bottom", fill="x")
+        tk.Button(btns, text="➕ Add layer", command=lambda: self._add_layer()).pack(side="left")
+        tk.Button(btns, text="🗑 Clear all", command=self._clear_layers).pack(side="left", padx=6)
+        tk.Button(btns, text="⚙ Layer FX", command=self._open_layerfx).pack(side="left")
+
+        listwrap = tk.Frame(parent); listwrap.pack(side="top", fill="both",
+                                                   expand=True, padx=4)
+        canvas = tk.Canvas(listwrap, highlightthickness=0)
+        sb = tk.Scrollbar(listwrap, orient="vertical", command=canvas.yview)
+        self.layers_host = tk.Frame(canvas)
+        win = canvas.create_window((0, 0), window=self.layers_host, anchor="nw")
+        self.layers_host.bind("<Configure>",
+                              lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self._wheel_scroll(canvas)
+
+    def _add_layer(self, id=None, **d):
+        # reuse a saved id (so its effect-knob cache matches) or mint a new one
+        if id:
+            lid = id
+            try:
+                self._layer_id = max(self._layer_id, int(str(id).lstrip("L")))
+            except ValueError:
+                pass
+        else:
+            self._layer_id += 1
+            lid = f"L{self._layer_id}"
+        eff_vals = [c.name for c in self.effect_classes]
+        # default to a concrete visual effect, not Blank or an empty Custom one
+        default_eff = (next((n for n in ("Plasma", "Liquid Fractal") if n in eff_vals), None)
+                       or next((n for n in eff_vals if not n.startswith(("Blank", "Custom"))),
+                               eff_vals[0] if eff_vals else ""))
+        box = tk.LabelFrame(self.layers_host, padx=6, pady=3)
+        box.pack(fill="x", padx=4, pady=2)
+        it = {"frame": box, "id": lid}
+
+        top = tk.Frame(box); top.pack(fill="x")
+        it["title"] = tk.Label(top, text="Layer")
+        it["title"].pack(side="left")
+        it["visible"] = tk.BooleanVar(value=bool(d.get("visible", True)))
+        tk.Checkbutton(top, text="on", variable=it["visible"],
+                       command=self._push_layers).pack(side="left", padx=2)
+        tk.Button(top, text="✕", width=2, fg="#a00",
+                  command=lambda: self._remove_layer(it)).pack(side="right")
+        tk.Button(top, text="⚙", width=2,
+                  command=lambda: (self.layer_sel.set(lid), self._open_layerfx())
+                  ).pack(side="right", padx=2)
+
+        r1 = tk.Frame(box); r1.pack(fill="x")
+        tk.Label(r1, text="Effect").pack(side="left")
+        it["effect"] = tk.StringVar(value=d.get("effect", default_eff))
+        ce = ttk.Combobox(r1, textvariable=it["effect"], state="readonly", values=eff_vals)
+        ce.pack(side="left", fill="x", expand=True, padx=3)
+        ce.bind("<<ComboboxSelected>>",
+                lambda e: (self._push_layers(), self._refresh_layer_params()))
+
+        r2 = tk.Frame(box); r2.pack(fill="x")
+        tk.Label(r2, text="Blend").pack(side="left")
+        it["blend"] = tk.StringVar(value=d.get("blend", "Normal"))
+        cb = ttk.Combobox(r2, textvariable=it["blend"], width=11, state="readonly",
+                          values=LAYER_BLENDS)
+        cb.pack(side="left", padx=3)
+        cb.bind("<<ComboboxSelected>>", lambda e: self._push_layers())
+        tk.Label(r2, text="Opacity").pack(side="left", padx=(8, 0))
+        it["opacity"] = tk.DoubleVar(value=float(d.get("opacity", 1.0)))
+        tk.Scale(r2, variable=it["opacity"], from_=0.0, to=1.0, resolution=0.01,
+                 orient="horizontal", showvalue=False,
+                 command=lambda v: self._push_layers_debounced()).pack(
+                     side="left", fill="x", expand=True, padx=(2, 4))
+
+        self.layer_items.append(it)
+        self.layer_sel.set(lid)
+        self._renumber_layers()
+        if getattr(self, "_theme", None):
+            self.apply_theme(self.theme_var.get())
+        self._push_layers()
+        return it
+
+    def _remove_layer(self, it):
+        try:
+            it["frame"].destroy()
+        except tk.TclError:
+            pass
+        if it in self.layer_items:
+            self.layer_items.remove(it)
+        self._renumber_layers()
+        self._push_layers()
+        self._refresh_layer_params()
+
+    def _clear_layers(self):
+        for it in list(getattr(self, "layer_items", [])):
+            try:
+                it["frame"].destroy()
+            except tk.TclError:
+                pass
+        self.layer_items = []
+        self._push_layers()
+        self._refresh_layer_params()
+
+    def _renumber_layers(self):
+        for i, it in enumerate(self.layer_items, 1):
+            try:
+                it["title"].config(text=f" Layer {i}")
+            except tk.TclError:
+                pass
+
+    def _collect_layer_dicts(self):
+        return [{"id": it["id"], "effect": it["effect"].get(),
+                 "blend": it["blend"].get(), "opacity": float(it["opacity"].get()),
+                 "visible": bool(it["visible"].get())}
+                for it in self.layer_items]
+
+    def _push_layers(self):
+        """Send the current layer stack to the engine (stored + applied live)."""
+        dicts = self._collect_layer_dicts()
+        self.engine.request_layers(dicts)
+        if hasattr(self, "layers_status"):
+            n = len(self.layer_items)
+            extra = max(0, n - MAX_LAYERS)
+            if extra:
+                self.layers_status.config(
+                    text=f"⚠ Up to {MAX_LAYERS} layers at once — {extra} extra ignored.",
+                    fg="#a60")
+            else:
+                self.layers_status.config(
+                    text=f"{n} layer{'' if n == 1 else 's'} over the main effect.",
+                    fg="#888")
+
+    def _push_layers_debounced(self):
+        prev = getattr(self, "_layers_after", None)
+        if prev:
+            try:
+                self.root.after_cancel(prev)
+            except Exception:
+                pass
+        self._layers_after = self.root.after(60, self._push_layers)
+
+    def _selected_layer(self):
+        lid = self.layer_sel.get() if getattr(self, "layer_sel", None) else ""
+        return next((it for it in getattr(self, "layer_items", []) if it["id"] == lid), None)
+
+    def _load_layers(self, layer_dicts):
+        for it in list(getattr(self, "layer_items", [])):
+            try:
+                it["frame"].destroy()
+            except tk.TclError:
+                pass
+        self.layer_items = []
+        for d in layer_dicts:
+            self._add_layer(id=d.get("id"),
+                            **{k: d[k] for k in ("effect", "blend", "opacity", "visible")
+                               if k in d})
+        self._push_layers()
+        self._refresh_layer_params()
+
+    # ---- Layer FX editor: full knobs for a selected layer's effect -------
+    def _build_layerfx_panel(self, parent):
+        head = tk.Frame(parent, padx=8, pady=4); head.pack(side="top", fill="x")
+        self.layerfx_label = tk.Label(head, text="", font=("", 9, "bold"),
+                                      wraplength=360, justify="left")
+        self.layerfx_label.pack(anchor="w")
+        tk.Label(head, text="The full knobs (look, grain, colors, audio/LFO drive) "
+                 "for this layer's effect — exactly like a normal effect.",
+                 fg="#888", wraplength=360, justify="left").pack(anchor="w")
+        self.layerfx_host = tk.Frame(parent)
+        self.layerfx_host.pack(side="top", fill="both", expand=True, padx=4, pady=4)
+        self._refresh_layer_params()
+
+    def _open_layerfx(self):
+        p = self._panel("layerfx")
+        self._set_visible(p, True)
+        if p["floating"] and p["toplevel"] is not None:
+            try:
+                p["toplevel"].deiconify(); p["toplevel"].lift()
+            except tk.TclError:
+                pass
+        self._refresh_layer_params()
+
+    def _refresh_layer_params(self, _retries=8):
+        """Populate the Layer FX panel with the selected layer's effect knobs."""
+        host = getattr(self, "layerfx_host", None)
+        if host is None:
+            return
+        for c in host.winfo_children():
+            c.destroy()
+        it = self._selected_layer()
+        if it is None:
+            self.layerfx_label.config(text="Layer FX")
+            tk.Label(host, text="Add a layer (🧱 Layers) and click its ⚙ to edit "
+                     "its effect here.", fg="#888", wraplength=360, justify="left",
+                     padx=8, pady=8).pack(anchor="w")
+            return
+        n = self.layer_items.index(it) + 1 if it in self.layer_items else "?"
+        self.layerfx_label.config(text=f"Layer {n}: {it['effect'].get()}")
+        d = self.engine.layer_fx_for(it["id"])
+        if d is None:                              # effect still spinning up
+            if _retries > 0:
+                self.root.after(120, lambda: self._refresh_layer_params(_retries - 1))
+            tk.Label(host, text="Starting this layer's effect…", fg="#888",
+                     padx=8, pady=6).pack(anchor="w")
+            return
+        self._params_grid(host, d["params"], d["store"], scroll=True)
+        if getattr(self, "_theme", None):
+            self.apply_theme(self.theme_var.get())
+
     def _place_selected(self, event):
         """Click/drag on the preview -> move the selected shape there. Acts only
         when a shape is selected in the Shapes panel (otherwise clicks do
@@ -1964,7 +2255,7 @@ class ControlPanel:
         tk.Label(drive, text="  drive:", fg="#446").pack(side="left")
         src = tk.StringVar(value=store.audio_src.get(p.name, "none"))
         menu = ttk.Combobox(drive, textvariable=src, width=7, state="readonly",
-                            values=[_DRIVE_LABELS[s] for s in AUDIO_SOURCES])
+                            values=[_DRIVE_LABELS[s] for s in DRIVE_SOURCES])
         menu.set(_DRIVE_LABELS[src.get()])
         menu.pack(side="left")
 
