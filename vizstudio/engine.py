@@ -25,6 +25,8 @@ from .media import media_params, BLEND_IDS
 from .shapes_fx import ShapesCompositor
 from .modulation import ModEngine
 from .midi import MidiEngine
+from .tempo import TempoEngine, phases_from_beats
+from .director import Director
 from .layers_fx import LayerCompositor, LAYER_BLEND_IDS, MAX_LAYERS
 
 
@@ -199,6 +201,15 @@ class Engine:
         # audio bands into one signal table each frame.
         self.mods = ModEngine()
         self.midi = MidiEngine()      # optional hardware controllers (CC -> drive)
+        self.tempo = TempoEngine()    # beat clock -> musical-time drive sources
+        self._prev_beat = False       # rising-edge detect to feed the beat clock
+        # Music Director: an offline song analysis (intensity / build / drops)
+        # that drives the show from the track's structure.
+        self.structure = None
+        self._structure_path = None
+        self._structure_status = ""
+        self._live_inten = 0.0        # live-audio intensity fallback (no song map)
+        self.director = Director()    # auto-pilot: choreography rules on the song
         self._shapes_np = np.zeros((shapelib.MAX_SHAPES, shapelib.NF), np.float32)
         self._shapes_count = 0
         # per-shape "show a different effect": name->class catalog + the live
@@ -323,6 +334,8 @@ class Engine:
             "shape_fx": fx,
             "mods": self.mods.to_dict(),
             "midi": self.midi.to_dict(),
+            "tempo": self.tempo.to_dict(),
+            "director": self.director.to_dict(),
             "layers": layers,
         }
 
@@ -336,6 +349,8 @@ class Engine:
             self._upload_palette(force=True)
         self.mods.load_dict(data.get("mods"))
         self.midi.load_dict(data.get("midi"))
+        self.tempo.load_dict(data.get("tempo"))
+        self.director.load_dict(data.get("director"))
         # rebuild the per-shape effect knob caches so reconcile restores them
         cache = {}
         for entry in data.get("shape_fx") or []:
@@ -452,6 +467,71 @@ class Engine:
 
     def _resolve(self, signals):
         return self._resolve_store(self.store, signals)
+
+    # ---- Music Director: song analysis -> drive sources ----------------
+    def analyze_track(self, path):
+        """Analyze a music file in the background -> self.structure, and set the
+        beat clock to the detected tempo. Safe to call from the UI thread."""
+        if not path:
+            return
+        self._structure_status = "analyzing…"
+        self.structure = None
+        self._structure_path = None
+
+        def work():
+            try:
+                import soundfile as sf
+                from .structure import analyze
+                data, sr = sf.read(path, dtype="float32", always_2d=True)
+                st = analyze(data, sr)
+                self.structure = st
+                self._structure_path = path
+                self.tempo.set_bpm(st.bpm)
+                self._structure_status = (f"BPM {st.bpm:.0f} · {len(st.drops)} drops "
+                                          f"· {st.duration:.0f}s")
+            except Exception as e:
+                self.structure = None
+                self._structure_status = f"analysis failed: {type(e).__name__}"
+        threading.Thread(target=work, daemon=True).start()
+
+    def _has_song_map(self):
+        """True when an analysis matches the file currently playing."""
+        return (self.structure is not None and self.audio is not None
+                and self.audio.current_file() == self._structure_path)
+
+    def _musical_beats(self):
+        """Continuous beat count — from the analyzed song's playback position
+        when we have a map for the playing track, else the wall-clock engine."""
+        if self._has_song_map() and self.structure.beat_times:
+            pos = self.audio.position()
+            beat0 = self.structure.beat_times[0]
+            return (pos - beat0) * self.structure.bpm / 60.0
+        return self.tempo.beats_now()
+
+    def _musical_signals(self):
+        """Bar/beat phases — locked to the song when we have a map, else clock."""
+        if self._has_song_map() and self.structure.beat_times:
+            return phases_from_beats(self._musical_beats())
+        return self.tempo.phases()
+
+    def _director_signals(self, feats):
+        """intensity / build / drop. From the song map at the playback position
+        (anticipatory) when available, else a live-audio fallback."""
+        if self._has_song_map():
+            pos = self.audio.position()
+            inten, build = self.structure.at(pos)
+            drop = 0.0
+            for d in self.structure.drops:
+                if 0.0 <= pos - d <= 2.0:                  # 2 s decay after a drop
+                    drop = max(drop, 1.0 - (pos - d) / 2.0)
+            return {"intensity": float(inten), "build": float(build), "drop": float(drop)}
+        # live fallback: smoothed volume + its rise (no look-ahead, no drops)
+        vol = float(feats.volume) if feats is not None else 0.0
+        prev = self._live_inten
+        self._live_inten += (vol - self._live_inten) * 0.05
+        return {"intensity": self._live_inten,
+                "build": min(1.0, max(0.0, (self._live_inten - prev) * 20.0)),
+                "drop": 0.0}
 
     # ---- secondary effects (shapes showing a different effect) ----------
     def _reconcile_secondary(self):
@@ -677,11 +757,23 @@ class Engine:
 
             feats = self.audio.features() if self.audio else None
             self.ctx.audio = feats
-            # one signal table per frame: audio bands + LFOs + MIDI, the drivers
-            # any knob can bind to (see ModEngine.signals / MidiEngine.values).
+            # feed the beat clock from the audio beat detector (auto mode only),
+            # on the rising edge of a detected beat.
+            beat_now = bool(feats.beat) if feats is not None else False
+            if self.tempo.auto and beat_now and not self._prev_beat:
+                self.tempo.on_beat(time.perf_counter())
+            self._prev_beat = beat_now
+
+            # one signal table per frame: audio bands + LFOs + MIDI + musical
+            # time (bar/beat) + the Music Director (intensity/build/drop).
+            dsig = self._director_signals(feats)
             signals = self.mods.signals(self.ctx.time, feats)
             signals.update(self.midi.values())
+            signals.update(self._musical_signals())
+            signals.update(dsig)
             self.ctx.p = self._resolve(signals)
+            # auto-pilot: steer params + fire scene changes from the song map
+            self.director.apply(self, self.ctx.p, dsig)
             self._upload_palette()
 
             if not self.paused:

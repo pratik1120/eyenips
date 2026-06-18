@@ -32,14 +32,27 @@ from . import project
 from .modulation import LFO_IDS, LFO_LABELS, LFO_SHAPES, N_LFOS
 from .layers_fx import LAYER_BLENDS, MAX_LAYERS
 from .midi import MIDI_IDS, MIDI_LABELS, N_MIDI
+from .tempo import TEMPO_IDS, TEMPO_LABELS
+from .structure import DIRECTOR_IDS, DIRECTOR_LABELS
+from .director import ACTIONS, TRIGGERS
 
 _DRIVE_LABELS = {"none": "—", "volume": "Vol", "bass": "Bass",
                  "mid": "Mid", "treble": "Treble", "beat": "Beat",
                  "kick": "Kick", "snare": "Snare", "hihat": "HiHat"}
 _DRIVE_LABELS.update(LFO_LABELS)
 _DRIVE_LABELS.update(MIDI_LABELS)
-# every numeric knob's "drive" menu offers all of these: audio bands + LFOs + MIDI
-DRIVE_SOURCES = list(AUDIO_SOURCES) + list(LFO_IDS) + list(MIDI_IDS)
+_DRIVE_LABELS.update(TEMPO_LABELS)
+_DRIVE_LABELS.update(DIRECTOR_LABELS)
+# every knob's "drive" menu: audio bands + the Music Director (intensity/build/
+# drop) + musical time (tempo) + LFOs + MIDI
+DRIVE_SOURCES = (list(AUDIO_SOURCES) + list(DIRECTOR_IDS) + list(TEMPO_IDS)
+                 + list(LFO_IDS) + list(MIDI_IDS))
+
+# panels that float in their own window, and panels hidden in the *default*
+# layout (still one click away in the Panels menu). Keeping defaults lean —
+# left: Audio / Media / Shapes; right: Effect / Layers / Parameters.
+_FLOATING_PANELS = ("create", "shapefx", "layerfx")
+_DEFAULT_HIDDEN_PANELS = _FLOATING_PANELS + ("mod", "midi", "director", "export")
 
 # UI color themes. Keys: bg (window), panel (boxes), fg (text), accent
 # (highlights), btn (buttons), entry/entry_fg (text inputs).
@@ -193,10 +206,12 @@ class ControlPanel:
             # --- left dock: inputs + the shapes editor ---
             dict(key="audio",  title="Audio",          builder=self._build_audio_section,
                  side="left",  floating=False, visible=True,  stretch="never",  minsize=140),
-            dict(key="mod",    title="🎛 Modulation (LFOs)", builder=self._build_mod_panel,
-                 side="left",  floating=False, visible=True,  stretch="never",  minsize=120),
+            dict(key="mod",    title="🎛 Modulation & Tempo", builder=self._build_mod_panel,
+                 side="left",  floating=False, visible=False, stretch="never",  minsize=120),
             dict(key="midi",   title="🎹 MIDI",          builder=self._build_midi_panel,
                  side="left",  floating=False, visible=False, stretch="never",  minsize=120),
+            dict(key="director", title="🎬 Music Director", builder=self._build_director_panel,
+                 side="left",  floating=False, visible=False, stretch="never",  minsize=150),
             dict(key="media",  title="Media",          builder=self._build_media_section,
                  side="left",  floating=False, visible=True,  stretch="never",  minsize=110),
             dict(key="shapes", title="✨ Shapes (elements)", builder=self._build_shapes_panel,
@@ -209,7 +224,7 @@ class ControlPanel:
             dict(key="params", title="Parameters",     builder=self._build_params_panel,
                  side="right", floating=False, visible=True,  stretch="always", minsize=180),
             dict(key="export", title="Export MP4",     builder=self._build_export_section,
-                 side="right", floating=False, visible=True,  stretch="never",  minsize=90),
+                 side="right", floating=False, visible=False, stretch="never",  minsize=90),
             # --- on-demand floating ---
             dict(key="shapefx", title="⚙ Shape FX", builder=self._build_shapefx_panel,
                  side="right", floating=True,  visible=False, stretch="always", minsize=320),
@@ -401,8 +416,8 @@ class ControlPanel:
             if p["toplevel"] is not None:
                 p["toplevel"].destroy(); p["toplevel"] = None
         for p in self.panels:
-            p["floating"] = p["key"] in ("create", "shapefx", "layerfx")
-            p["visible"] = p["key"] not in ("create", "shapefx", "layerfx")
+            p["floating"] = p["key"] in _FLOATING_PANELS
+            p["visible"] = p["key"] not in _DEFAULT_HIDDEN_PANELS
             p["menu_var"].set(p["visible"])
         self._build_all_panels()
         self.apply_theme(self.theme_var.get())
@@ -412,11 +427,137 @@ class ControlPanel:
         """Editor for the LFOs. Route one to any knob via that knob's 'drive'
         menu (the LFO 1–4 entries). Edits go straight to the engine's ModEngine,
         which is read on the render thread — no rebuild, smooth while dragging."""
-        tk.Label(parent, text="Free-running shapes you can route to ANY knob: open "
-                 "a knob's 'drive' menu and pick LFO 1–4.", fg="#888",
+        self._build_tempo_controls(parent)
+        tk.Label(parent, text="LFOs — free-running shapes you can route to ANY "
+                 "knob: open a knob's 'drive' menu and pick LFO 1–4.", fg="#888",
                  wraplength=360, justify="left").pack(anchor="w", padx=6, pady=(2, 4))
         for i in range(N_LFOS):
             self._build_lfo_row(parent, i)
+
+    def _build_tempo_controls(self, parent):
+        """The beat clock: set/tap a tempo, mark the downbeat, or follow the
+        audio beat. Bar/beat phases then appear in every knob's drive menu."""
+        box = tk.LabelFrame(parent, text="🥁 Tempo / beat clock", padx=6, pady=3)
+        box.pack(fill="x", padx=6, pady=(2, 4))
+
+        r = tk.Frame(box); r.pack(fill="x")
+        tk.Label(r, text="BPM").pack(side="left")
+        self.bpm_var = tk.StringVar(value=f"{self.engine.tempo.bpm():.0f}")
+        e = tk.Entry(r, textvariable=self.bpm_var, width=6)
+        e.pack(side="left", padx=3)
+        e.bind("<Return>", self._set_bpm_from_entry)
+        tk.Button(r, text="Set", width=3, command=self._set_bpm_from_entry).pack(side="left")
+        tk.Button(r, text="Tap", width=4, command=self._tap_tempo).pack(side="left", padx=3)
+        self.bpm_live = tk.Label(r, text="", fg="#888")
+        self.bpm_live.pack(side="left", padx=4)
+
+        r2 = tk.Frame(box); r2.pack(fill="x")
+        tk.Button(r2, text="◉ Set downbeat", command=self.engine.tempo.align).pack(side="left")
+        self.tempo_auto = tk.BooleanVar(value=self.engine.tempo.auto)
+        tk.Checkbutton(r2, text="Auto (follow the beat)", variable=self.tempo_auto,
+                       command=lambda: self.engine.tempo.set_auto(self.tempo_auto.get())
+                       ).pack(side="left", padx=6)
+        tk.Label(box, text="Drive any knob by Bar / 1-4 note / Beat pulse… from its "
+                 "'drive' menu — locked to the song, not to seconds.", fg="#888",
+                 wraplength=360, justify="left").pack(anchor="w")
+
+    def _set_bpm_from_entry(self, *_a):
+        try:
+            self.engine.tempo.set_bpm(float(self.bpm_var.get()))
+        except (ValueError, tk.TclError):
+            pass
+
+    def _tap_tempo(self):
+        self.engine.tempo.tap()
+        if getattr(self, "bpm_var", None) is not None:
+            self.bpm_var.set(f"{self.engine.tempo.bpm():.0f}")
+
+    def _load_tempo(self):
+        """Reflect a restored tempo in the panel widgets."""
+        if getattr(self, "bpm_var", None) is not None:
+            self.bpm_var.set(f"{self.engine.tempo.bpm():.0f}")
+        if getattr(self, "tempo_auto", None) is not None:
+            self.tempo_auto.set(self.engine.tempo.auto)
+
+    # ---- Music Director panel ------------------------------------------
+    def _build_director_panel(self, parent):
+        """Analyze the loaded track and (optionally) let it run the show."""
+        head = tk.Frame(parent, padx=8, pady=4); head.pack(side="top", fill="x")
+        tk.Label(head, text="Eyenips reads the song's shape — beats, builds, "
+                 "drops. Play an audio File, then drive any knob with Intensity / "
+                 "Build / Drop from its 'drive' menu, or hand it the auto-pilot.",
+                 wraplength=360, justify="left", font=("", 9, "bold")).pack(anchor="w")
+
+        box = tk.Frame(parent, padx=8); box.pack(side="top", fill="x", pady=(0, 2))
+        tk.Button(box, text="🔎 Analyze current track",
+                  command=self._analyze_current).pack(side="left")
+        self.director_status = tk.Label(parent, text="", fg="#888", wraplength=360,
+                                        justify="left", padx=8)
+        self.director_status.pack(side="top", fill="x", anchor="w")
+
+        auto = tk.LabelFrame(parent, text="Auto-pilot (it runs the show)",
+                             padx=6, pady=3)
+        auto.pack(side="top", fill="x", padx=6, pady=4)
+        self.dir_auto_inten = tk.BooleanVar(value=self.engine.director.auto_intensity)
+        tk.Checkbutton(auto, text="Auto-intensity — brightness & feedback follow the "
+                       "song's energy", variable=self.dir_auto_inten,
+                       command=self._apply_director, wraplength=320, justify="left",
+                       anchor="w").pack(anchor="w")
+
+        r = tk.Frame(auto); r.pack(fill="x", pady=(2, 0))
+        tk.Label(r, text="Switch:").pack(side="left")
+        self.dir_action = tk.StringVar(value=self.engine.director.action)
+        ca = ttk.Combobox(r, textvariable=self.dir_action, width=13, state="readonly",
+                          values=ACTIONS)
+        ca.pack(side="left", padx=3)
+        ca.bind("<<ComboboxSelected>>", lambda e: self._apply_director())
+        self.dir_trigger = tk.StringVar(value=self.engine.director.trigger)
+        ct = ttk.Combobox(r, textvariable=self.dir_trigger, width=11, state="readonly",
+                          values=TRIGGERS)
+        ct.pack(side="left", padx=3)
+        ct.bind("<<ComboboxSelected>>", lambda e: self._apply_director())
+        self.dir_bars = tk.IntVar(value=self.engine.director.every_bars)
+        tk.Spinbox(r, from_=1, to=64, width=4, textvariable=self.dir_bars,
+                   command=self._apply_director).pack(side="left", padx=3)
+        tk.Label(r, text="bars").pack(side="left")
+        self._refresh_director()
+
+    def _analyze_current(self):
+        path = self.engine.audio.current_file() if self.engine.audio else None
+        if not path:
+            self._set_status("Load an audio File first (Audio panel).", error=True)
+            return
+        self.engine.analyze_track(path)
+        self._refresh_director()
+
+    def _apply_director(self):
+        d = self.engine.director
+        if getattr(self, "dir_auto_inten", None) is None:
+            return
+        d.auto_intensity = bool(self.dir_auto_inten.get())
+        d.action = self.dir_action.get()
+        d.trigger = self.dir_trigger.get()
+        try:
+            d.every_bars = max(1, int(self.dir_bars.get()))
+        except (ValueError, tk.TclError):
+            pass
+
+    def _refresh_director(self):
+        if getattr(self, "director_status", None) is not None:
+            try:
+                self.director_status.config(
+                    text=self.engine._structure_status or "No track analyzed yet.")
+            except tk.TclError:
+                pass
+
+    def _load_director(self):
+        d = self.engine.director
+        if getattr(self, "dir_auto_inten", None) is not None:
+            self.dir_auto_inten.set(d.auto_intensity)
+            self.dir_action.set(d.action)
+            self.dir_trigger.set(d.trigger)
+            self.dir_bars.set(d.every_bars)
+        self._refresh_director()
 
     def _build_lfo_row(self, parent, i):
         cfg = self.engine.mods.get_lfo(i)
@@ -785,6 +926,15 @@ class ControlPanel:
             # live MIDI read-outs (assigned CC + value / learning) when shown
             if self._pump_count % 6 == 0 and getattr(self, "_midi_rows", None):
                 self._refresh_midi()
+            # live tempo read-out (BPM drifts in auto mode)
+            if self._pump_count % 6 == 0 and getattr(self, "bpm_live", None) is not None:
+                try:
+                    self.bpm_live.config(text=f"now {self.engine.tempo.bpm():.1f}")
+                except tk.TclError:
+                    pass
+            # Music Director status (background analysis finishing)
+            if self._pump_count % 12 == 0 and getattr(self, "director_status", None) is not None:
+                self._refresh_director()
             # coalesce changes into undo steps (~twice a second)
             if self._pump_count % 30 == 0:
                 self._maybe_snapshot()
@@ -1091,6 +1241,8 @@ class ControlPanel:
             self._loaded_audio = path
             self.audio_mode.set("file")
             self.engine.audio.set_mode("file", path)
+            self.engine.analyze_track(path)     # Music Director: map the song
+            self._refresh_director()
 
     def _on_audio_mode(self):
         mode = self.audio_mode.get()
@@ -1171,6 +1323,8 @@ class ControlPanel:
         self._load_shapes(data.get("shapes") or [])
         self._load_layers(data.get("layers") or [])
         self._load_midi(data.get("midi") or {})
+        self._load_tempo()
+        self._load_director()
         self._apply_audio(data.get("audio") or {})
         self._apply_media(data.get("media") or {})
         if with_layout and data.get("layout"):
@@ -1203,6 +1357,7 @@ class ControlPanel:
             if mode == "file" and f and os.path.exists(f):
                 self._loaded_audio = f
                 self.engine.audio.set_mode("file", f)
+                self.engine.analyze_track(f)        # re-map the song for the Director
             else:
                 self.engine.audio.set_mode("none" if mode == "file" else mode)
 

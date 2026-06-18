@@ -77,6 +77,10 @@ class AudioEngine:
         self._stop = threading.Event()
         self._gain = 1.0
         self.status = "idle"
+        # file-playback position (so the Music Director can sync its song map)
+        self._file_pos = 0          # frames played
+        self._file_sr = SAMPLE_RATE
+        self._file_dur = 0.0
 
         # smoothing + beat-detection state
         # order: vol, bass, mid, treble, kick, snare, hihat
@@ -93,6 +97,15 @@ class AudioEngine:
     def current_file(self):
         """The audio file currently loaded (File mode), or None."""
         return self._file_path if self._mode == "file" else None
+
+    def position(self):
+        """Seconds into the loaded file (File mode), else 0.0."""
+        if self._mode == "file" and self._file_sr:
+            return self._file_pos / self._file_sr
+        return 0.0
+
+    def duration(self):
+        return self._file_dur
 
     def features(self):
         with self._lock:
@@ -212,6 +225,9 @@ class AudioEngine:
         self.status = f"file: {self._file_path.split('/')[-1].split(chr(92))[-1]}"
         idx = 0
         n = data.shape[0]
+        self._file_sr = sr
+        self._file_dur = n / sr
+        self._file_pos = 0
         ev = threading.Event()
 
         def callback(outdata, frames, time_info, status):
@@ -227,6 +243,7 @@ class AudioEngine:
             mono = chunk.mean(axis=1)
             self._analyze(mono.astype(np.float32))
             idx = end
+            self._file_pos = idx        # expose playback position
 
         with sd.OutputStream(samplerate=sr, channels=data.shape[1],
                              blocksize=BLOCK, callback=callback,

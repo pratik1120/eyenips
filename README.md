@@ -109,6 +109,55 @@ the port) are saved with your project. MIDI needs `mido` + a backend
 (`pip install mido pygame`); without them the panel says so and the rest of the
 app is unaffected.
 
+### 🎯 The Music Director — visuals locked to the *song*, not the clock
+
+Every other visualizer reacts to raw **loudness**. Eyenips also keeps a **beat
+clock** — a tempo + bar/beat grid — so motion can be locked to *musical time*.
+In the **🥁 Tempo** block (Modulation panel):
+
+- **Set / type a BPM**, **Tap** it out, or turn on **Auto** to follow the audio
+  beat detector (it estimates BPM from the gaps between kicks and stays in
+  phase). **Set downbeat** marks where bar 1 lands.
+
+Then every knob's `drive:` menu gains **musical sources** alongside the audio
+bands and LFOs:
+
+- **Bar / 1-2 / 1-4 / 1-8 note** — smooth motion that completes in exactly that
+  musical division (a sine that breathes over *one bar*, perfectly).
+- **Beat pulse / Bar pulse** — a hit that snaps up on each beat / downbeat and
+  decays, for flashes and stabs that land *on the beat*.
+
+So "zoom breathes once per bar" or "size punches on every kick" are one pick +
+one amount — locked to the music, not wall-clock seconds.
+
+**It reads the song's shape.** Open the **🎬 Music Director** panel and play an
+audio **File** — Eyenips analyzes the track once (it's automatic on load) and
+maps its **structure**: tempo, beat grid, an **energy/intensity curve**, the
+**build-ups**, and the **drops**. That map becomes three new drive sources in
+*every knob's* `drive:` menu:
+
+- **Intensity** — the song's energy, normalized over the whole track, so it
+  *ramps through every build and peaks on the drop*. Map it to feedback, particle
+  count, brightness, zoom — anything — and that knob now follows the song's arc.
+- **Build** — how fast intensity is rising (high during build-ups). Map it to
+  something that tightens before the drop.
+- **Drop** — a hit that fires on each detected drop and decays. Map it to a flash,
+  a feedback burst, a shape explosion.
+
+Because it analyzes the *whole* file up front, Intensity is **anticipatory** — it
+genuinely knows the drop is coming, not just reacting late to loudness. (For live
+System/Mic audio with no song map, Intensity falls back to a smoothed level.)
+
+**Auto-pilot — it runs the show.** In the Director panel:
+
+- **Auto-intensity** — brightness breathes with the song's energy and any feedback
+  intensifies on the drop, with *zero* wiring. Press play and the visuals follow.
+- **Auto-switch** — change **palette** or **effect** automatically **on each drop**
+  or **every N bars**. The set choreographs itself while you design the looks.
+
+It's all pure musical **analysis** — no AI, no generation; you remain the artist.
+The whole Director (tempo, auto-pilot settings) saves with your project.
+
 ### Layers — stack & blend effects
 
 The **🧱 Layers** panel stacks extra effects *on top of* the main effect, like
@@ -262,6 +311,12 @@ vizstudio/
   audio.py      capture (system/mic/file) -> FFT -> bass/mid/treble/volume/beat
   media.py      camera / image / video input -> a frame the engine composites
   midi.py       MIDI input (optional): maps controllers to the MIDI 1-8 drivers
+  tempo.py      beat clock: tempo + bar/beat grid -> musical-time drive sources
+                (Bar / 1-4 note / Beat pulse …)
+  structure.py  Music Director: offline song analysis (tempo, intensity curve,
+                builds, drops) -> Intensity / Build / Drop drive sources
+  director.py   auto-pilot choreography: intensity master + auto-switch palette/
+                effect on drops or every N bars
   postfx.py     global look: trails, fluid, grain, flicker, fade, brightness +
                 Feedback (recursive frame feedback: tunnels / spirals / echoes)
   engine.py     owns canvas + colors + audio + media + post-FX, runs the loop;
