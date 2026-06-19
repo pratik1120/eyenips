@@ -923,6 +923,15 @@ class ControlPanel:
                     self.audio_status.config(text=self.engine.audio.status)
                 if self.engine.media and hasattr(self, "media_status"):
                     self.media_status.config(text=self.engine.media.status)
+                # keep the Media 'Show' + Become-the-Visual dropdowns in sync
+                if getattr(self, "media_show", None) is not None:
+                    v = self.engine.store.values.get("media_blend", "Off")
+                    if v != self.media_show.get():
+                        self.media_show.set(v)
+                if getattr(self, "mirror_var", None) is not None:
+                    v = self.engine.store.values.get("mirror", "Off")
+                    if v != self.mirror_var.get():
+                        self.mirror_var.set(v)
             # live MIDI read-outs (assigned CC + value / learning) when shown
             if self._pump_count % 6 == 0 and getattr(self, "_midi_rows", None):
                 self._refresh_midi()
@@ -1061,6 +1070,17 @@ class ControlPanel:
         tk.Button(b, text="Load image…", command=lambda: self._pick_media("image")).pack(side="left")
         tk.Button(b, text="Load video…", command=lambda: self._pick_media("video")).pack(side="left", padx=6)
 
+        # how the media SHOWS (it's invisible when this is Off — the #1 gotcha)
+        srow = tk.Frame(box); srow.pack(fill="x", pady=(4, 0))
+        tk.Label(srow, text="Show:").pack(side="left")
+        self.media_show = tk.StringVar(value=self.engine.store.values.get("media_blend", "Off"))
+        ssb = ttk.Combobox(srow, textvariable=self.media_show, width=9, state="readonly",
+                           values=["Off", "Behind", "Tint", "Screen", "Warp"])
+        ssb.pack(side="left", padx=3)
+        ssb.bind("<<ComboboxSelected>>",
+                 lambda e: self.engine.store.set("media_blend", self.media_show.get()))
+        tk.Label(srow, text="Behind = plain backdrop", fg="#888").pack(side="left")
+
         self.media_status = tk.Label(box, text="off", fg="#666",
                                      wraplength=380, justify="left")
         self.media_status.pack(anchor="w", pady=(2, 0))
@@ -1069,6 +1089,30 @@ class ControlPanel:
                  "distort your media. For full control (texture / react to motion) "
                  "build an effect in ✎ Create Effect with Output = Texture/Warp.",
                  fg="#888", wraplength=380, justify="left").pack(anchor="w")
+
+        # --- 🪞 Become the Visual (interactive art) ---
+        mir = tk.LabelFrame(box, text="🪞 Become the Visual", padx=6, pady=3)
+        mir.pack(fill="x", pady=(6, 2))
+        r = tk.Frame(mir); r.pack(fill="x")
+        tk.Label(r, text="Mode").pack(side="left")
+        self.mirror_var = tk.StringVar(value=self.engine.store.values.get("mirror", "Off"))
+        cb = ttk.Combobox(r, textvariable=self.mirror_var, width=18, state="readonly",
+                          values=["Off", "Become the effect", "Push by motion", "Both"])
+        cb.pack(side="left", padx=3)
+        cb.bind("<<ComboboxSelected>>",
+                lambda e: self.engine.store.set("mirror", self.mirror_var.get()))
+        tk.Button(r, text="Reset background", command=self._reset_background).pack(side="left", padx=4)
+        tk.Label(mir, text="Turn the Camera on, then BECOME the effect — it renders "
+                 "inside your silhouette (you're made of fire/plasma), and your "
+                 "motion pushes it. Stand still a sec after 'Reset background'. "
+                 "Tune Motion push / Show-me in Parameters.",
+                 fg="#888", wraplength=360, justify="left").pack(anchor="w")
+
+    def _reset_background(self):
+        """Re-learn the empty scene for the silhouette (step out, click, step in)."""
+        if self.engine.media is not None:
+            self.engine.media.reset_background()
+            self._set_status("Background reset — stand still a moment, then move.")
 
     def _on_media_mode(self):
         mode = self.media_mode.get()
@@ -1092,15 +1136,23 @@ class ControlPanel:
         self._media_on_hint(kind)
 
     def _media_on_hint(self, mode):
-        """When a media source is turned on, nudge the user toward the texture/
-        warp output (the interesting use) rather than silently doing nothing."""
+        """When a media source is turned on, MAKE IT VISIBLE. Media is invisible
+        when 'Show' (media_blend) is Off, which reads as 'media is broken' — so if
+        the current effect doesn't already use the media as a texture, flip Show
+        to Behind so the camera/image/video appears right away."""
         if mode == "off":
             return
-        cur = getattr(self.engine.effect, "source", None)
-        if cur in (None, "paint") and self.engine.store.values.get("media_blend") == "Off":
+        src = getattr(self.engine.effect, "source", None)
+        uses_media = src in ("texture", "warp")     # effect already draws the media
+        if not uses_media and self.engine.store.values.get("media_blend", "Off") == "Off":
+            self.engine.store.set("media_blend", "Behind")
+            if getattr(self, "media_show", None) is not None:
+                self.media_show.set("Behind")
             self.media_status.config(
-                text=f"{self.engine.media.status} — now open ✎ Create Effect → "
-                     "Output: Texture or Warp.", fg="#06c")
+                text=f"{self.engine.media.status} — showing as backdrop. Change "
+                     "'Show' to mix it, or try 🪞 Become the Visual.", fg="#06c")
+        else:
+            self.media_status.config(text=self.engine.media.status, fg="#06c")
 
     # ---- panel content builders (each takes its panel body as `parent`) --
     def _build_audio_section(self, parent):

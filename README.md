@@ -191,8 +191,10 @@ when you switch effects or hit Reset.
 ### Camera / image / video — as the *material* the effects act on
 
 In the **Media (camera / image / video)** section pick a source: your **webcam**,
-an **image**, or a **video** file (loops). Then in **✎ Create Effect** set
-**Output** to control how the effect uses it:
+an **image**, or a **video** file (loops). It **shows right away** as a backdrop
+(the **Show** dropdown — Off / Behind / Tint / Screen / Warp — controls how it
+mixes; turning a source on flips it to *Behind* for you). For deeper use, in
+**✎ Create Effect** set **Output** to control how the effect uses it:
 
 - **Texture the media** — the effect plays *on* the media: your blocks/formulas
   brighten, reveal, and modulate the actual image/video pixels.
@@ -213,6 +215,27 @@ are normal knobs, so they're **audio-drivable** (e.g. Media opacity ← Beat).
 
 Needs `opencv-python`; without it the Media section is hidden and everything
 else works.
+
+### 🪞 Become the Visual — *you* are the art (interactive, no AI)
+
+Point your webcam at yourself and **you get rendered as the effect** — not a
+backdrop, *you*. In the Media panel, turn the **Camera** on and pick a
+**🪞 Become the Visual** mode:
+
+- **Become the effect** — the effect plays *inside your silhouette*. You're made
+  of fire. You're made of plasma. (Click **Reset background**, stand still a
+  second so it learns the empty room, then move — you light up.)
+- **Push by motion** — your movement *shoves the visual around*; wave a hand and
+  the image flows away from it.
+- **Both** — you're made of light *and* it flows as you move.
+
+It's pure OpenCV — background subtraction for the silhouette, dense optical flow
+for the motion — **no AI, no extra installs**. Two knobs (**Motion push**,
+**Show me**) live in Parameters, so they're audio/LFO/**Intensity**-drivable too.
+
+Now combine it with the Music Director: **you, made of fire, dancing — and the
+fire explodes on the drop.** That's the clip worth filming. Point a phone at the
+screen, post it.
 
 ### Shapes (elements) — objects that *interact* with your effect
 
@@ -309,7 +332,8 @@ vizstudio/
   effect.py     Effect base class + Context (what every effect receives)
   color.py      palette specs -> a 256-entry RGB lookup table the GPU samples
   audio.py      capture (system/mic/file) -> FFT -> bass/mid/treble/volume/beat
-  media.py      camera / image / video input -> a frame the engine composites
+  media.py      camera / image / video input -> a frame the engine composites;
+                also silhouette + optical flow for "Become the Visual" (OpenCV)
   midi.py       MIDI input (optional): maps controllers to the MIDI 1-8 drivers
   tempo.py      beat clock: tempo + bar/beat grid -> musical-time drive sources
                 (Bar / 1-4 note / Beat pulse …)
