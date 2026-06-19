@@ -15,6 +15,7 @@ falls back to silence and the app still runs.
 from __future__ import annotations
 
 import threading
+import time
 import numpy as np
 
 SAMPLE_RATE = 44100
@@ -73,6 +74,7 @@ class AudioEngine:
         self._features = AudioFeatures()
         self._mode = "none"
         self._file_path = None
+        self._sys_device = None      # which output to loopback (None = default)
         self._thread = None
         self._stop = threading.Event()
         self._gain = 1.0
@@ -87,6 +89,12 @@ class AudioEngine:
         self._smooth = np.zeros(7, dtype=np.float32)
         self._bass_history = np.zeros(43, dtype=np.float32)  # ~1s at this block size
         self._beat_cooldown = 0
+        # adaptive gain: a decaying running peak per band, so a loud (rock) and a
+        # quiet master both use the full 0..1 range. Fixed divisors used to pin
+        # loud tracks at 1.0 -> every band looked "constant" except the hi-hat.
+        self._peak = np.full(7, 1e-4, dtype=np.float32)
+        self._peak_decay = 0.992          # ~4 s release at this block rate
+        self._band_ema = np.zeros(7, dtype=np.float32)  # short avg, for transients
         self._window = np.hanning(BLOCK).astype(np.float32)
         self._freqs = np.fft.rfftfreq(BLOCK, 1.0 / SAMPLE_RATE)
 
@@ -116,11 +124,28 @@ class AudioEngine:
             snap.beat, snap.spectrum = f.beat, f.spectrum
             return snap
 
-    def set_mode(self, mode, file_path=None):
-        """Switch audio source. Restarts the capture thread."""
+    def list_outputs(self):
+        """Output devices available for system-sound (loopback) capture.
+
+        The 'System' source visualizes whatever is playing on the PC; on a
+        machine with several outputs the user has to point us at the one their
+        music is actually using, or the screen stays black."""
+        try:
+            import soundcard as sc
+            return [s.name for s in sc.all_speakers()]
+        except Exception:
+            return []
+
+    def set_mode(self, mode, file_path=None, device=None):
+        """Switch audio source. Restarts the capture thread.
+
+        `device` (system mode only) is the output-device name to loop back;
+        None means the current default speaker."""
         self.stop()
         self._mode = mode
         self._file_path = file_path
+        if device is not None:
+            self._sys_device = device
         if mode == "none":
             self.status = "silent"
             return
@@ -140,11 +165,13 @@ class AudioEngine:
             mono = np.pad(mono, (0, BLOCK - mono.shape[0]))
         else:
             mono = mono[:BLOCK]
-        mono = mono * self._window * self._gain
+        # window only here; sensitivity (gain) is applied AFTER the AGC below,
+        # otherwise dividing by the running peak would cancel it out entirely.
+        mono = mono * self._window
         mag = np.abs(np.fft.rfft(mono))
         freqs = self._freqs
 
-        vol = float(np.sqrt(np.mean((mono) ** 2)) * 4.0)
+        vol = float(np.sqrt(np.mean(mono ** 2)))
         bass = _band_energy(mag, freqs, 20, 250)
         mid = _band_energy(mag, freqs, 250, 2000)
         treble = _band_energy(mag, freqs, 2000, 8000)
@@ -153,10 +180,25 @@ class AudioEngine:
         snare = _band_energy(mag, freqs, 180, 520)     # snare body
         hihat = _band_energy(mag, freqs, 8000, 16000)  # cymbals / hats
 
-        # crude per-band normalization to land in ~0..1, then smooth
-        raw = np.array([vol, bass / 60.0, mid / 30.0, treble / 20.0,
-                        kick / 55.0, snare / 26.0, hihat / 9.0], dtype=np.float32)
-        raw = np.clip(raw, 0.0, 1.0)
+        e = np.array([vol, bass, mid, treble, kick, snare, hihat], dtype=np.float32)
+        # --- adaptive gain (AGC): normalize each band by its own recent peak so
+        # the full 0..1 range is used no matter how loud the master is. ----------
+        self._peak = np.maximum(e, self._peak * self._peak_decay)
+        if vol < 5e-4:                                   # near-silence: don't amp hiss
+            level = np.zeros(7, dtype=np.float32)
+        else:
+            level = np.clip(e / (self._peak + 1e-9), 0.0, 1.0)
+
+        # --- transient "punch": on a brick-walled master the level barely moves,
+        # so emphasize each band's RISE above its own short average. Drum bands
+        # lean on this so kicks/snares/hats still pulse out of the wall of sound.
+        self._band_ema += (level - self._band_ema) * 0.25
+        punch = np.clip((level - self._band_ema) * 3.0, 0.0, 1.0)
+        raw = level.copy()
+        for i in (4, 5, 6):                              # kick, snare, hihat
+            raw[i] = max(level[i] * 0.4, punch[i])
+        raw = np.clip(raw * self._gain, 0.0, 1.0)        # Sensitivity acts here
+
         # fast attack, slow release.  Drum bands (kick/snare/hihat) use a
         # snappier release so hits read as punchy hits, not sustained levels.
         for i in range(7):
@@ -165,14 +207,16 @@ class AudioEngine:
             a = up if raw[i] > self._smooth[i] else down
             self._smooth[i] += (raw[i] - self._smooth[i]) * a
 
-        # beat detection on bass energy vs rolling average
+        # beat detection on the kick/bass (whichever is stronger) vs its rolling
+        # average — rock beats live in the kick, EDM in the sub-bass.
+        beat_src = max(self._smooth[1], self._smooth[4])
         self._bass_history = np.roll(self._bass_history, -1)
-        self._bass_history[-1] = self._smooth[1]
+        self._bass_history[-1] = beat_src
         avg = float(np.mean(self._bass_history)) + 1e-4
         beat = False
         if self._beat_cooldown > 0:
             self._beat_cooldown -= 1
-        elif self._smooth[1] > avg * 1.4 and self._smooth[1] > 0.15:
+        elif beat_src > avg * 1.4 and beat_src > 0.15:
             beat = True
             self._beat_cooldown = 6
 
@@ -203,20 +247,42 @@ class AudioEngine:
         except Exception as e:  # never let audio crash the app
             self.status = f"audio off ({type(e).__name__}: {e})"
 
+    def _pick_speaker(self, sc):
+        """Resolve the chosen output device (for system loopback), tolerant of
+        slightly-mismatched names; fall back to the default speaker."""
+        name = self._sys_device
+        if name:
+            try:
+                return sc.get_speaker(name)
+            except Exception:
+                for s in sc.all_speakers():
+                    if name.lower() in s.name.lower() or s.name.lower() in name.lower():
+                        return s
+        return sc.default_speaker()
+
     def _run_soundcard(self):
         import soundcard as sc
         if self._mode == "system":
-            spk = sc.default_speaker()
+            spk = self._pick_speaker(sc)
             mic = sc.get_microphone(spk.name, include_loopback=True)
-            self.status = f"system: {spk.name}"
+            base = f"system: {spk.name}"
         else:
             mic = sc.default_microphone()
-            self.status = f"mic: {mic.name}"
+            base = f"mic: {mic.name}"
+        self.status = base
+        last_status = 0.0
         with mic.recorder(samplerate=SAMPLE_RATE, blocksize=BLOCK) as rec:
             while not self._stop.is_set():
                 data = rec.record(numframes=BLOCK)
                 mono = data.mean(axis=1) if data.ndim > 1 else data
                 self._analyze(mono.astype(np.float32))
+                # silence-aware status: connected-but-quiet must not look broken
+                now = time.perf_counter()
+                if now - last_status > 0.4:
+                    last_status = now
+                    playing = float(np.abs(data).max()) > 1e-3
+                    self.status = (f"{base}  ▶ playing" if playing
+                                   else f"{base}  … silent (play something)")
 
     def _run_file(self):
         import soundfile as sf

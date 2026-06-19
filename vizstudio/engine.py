@@ -87,14 +87,11 @@ class MediaCompositor:
     """Owns the media frame + camera-motion fields, computes motion, and (for
     the optional 'Background' mode) blends media with the canvas."""
 
-    def __init__(self, canvas, media, motion, prev, silhouette, flow, mbuf):
+    def __init__(self, canvas, media, motion, prev):
         self.canvas = canvas
         self.media = media
         self.motion = motion     # ti.field(f32): camera-motion magnitude 0..1
         self.prev = prev         # ti.field(f32): previous-frame luma
-        self.silhouette = silhouette  # ti.field(f32): you vs background (0..1)
-        self.flow = flow         # ti.Vector.field(2): your motion vectors
-        self.mbuf = mbuf         # ti.Vector.field(3): scratch for the flow push
         self.w, self.h = canvas.shape[0], canvas.shape[1]
 
     @ti.func
@@ -149,46 +146,6 @@ class MediaCompositor:
                 out = self._smp(u, v) * br
             self.canvas[i, j] = out
 
-    # ---- "Become the Visual": you ARE the effect -----------------------
-    @ti.func
-    def _smp_buf(self, u, v):
-        """Bilinear sample of the scratch buffer at normalized (u, v)."""
-        fx = u * (self.w - 1)
-        fy = v * (self.h - 1)
-        x0 = ti.cast(ti.floor(fx), ti.i32)
-        y0 = ti.cast(ti.floor(fy), ti.i32)
-        ax = fx - x0
-        ay = fy - y0
-        x0 = ti.max(0, ti.min(self.w - 1, x0))
-        y0 = ti.max(0, ti.min(self.h - 1, y0))
-        x1 = ti.min(self.w - 1, x0 + 1)
-        y1 = ti.min(self.h - 1, y0 + 1)
-        a = self.mbuf[x0, y0] * (1 - ax) + self.mbuf[x1, y0] * ax
-        b = self.mbuf[x0, y1] * (1 - ax) + self.mbuf[x1, y1] * ax
-        return a * (1 - ay) + b * ay
-
-    @ti.kernel
-    def become(self, bg: ti.f32):
-        """Mask the visual by your silhouette — the effect shows INSIDE you;
-        outside fades to black (or a faint camera ghost via `bg`)."""
-        for i, j in self.canvas:
-            m = ti.min(ti.max(self.silhouette[i, j], 0.0), 1.0)
-            self.canvas[i, j] = self.canvas[i, j] * m + self.media[i, j] * bg * (1.0 - m)
-
-    @ti.kernel
-    def push_save(self):
-        for i, j in self.canvas:
-            self.mbuf[i, j] = self.canvas[i, j]
-
-    @ti.kernel
-    def push(self, amount: ti.f32):
-        """Displace the visual along your motion — it flows where you move."""
-        for i, j in self.canvas:
-            f = self.flow[i, j]
-            u = i / self.w - f[0] * amount
-            v = j / self.h - f[1] * amount
-            self.canvas[i, j] = self._smp_buf(u, v)
-
 
 @ti.data_oriented
 class Presenter:
@@ -225,10 +182,6 @@ class Engine:
         self.media_field = ti.Vector.field(3, ti.f32, shape=(width, height))
         self.motion_field = ti.field(ti.f32, shape=(width, height))
         self._prev_luma = ti.field(ti.f32, shape=(width, height))
-        # "Become the Visual": your silhouette + motion-flow fields
-        self.silhouette_field = ti.field(ti.f32, shape=(width, height))
-        self.flow_field = ti.Vector.field(2, ti.f32, shape=(width, height))
-        self._mirror_buf = ti.Vector.field(3, ti.f32, shape=(width, height))
         self.postfx = PostFX(width, height, self.canvas)
         # GPU "present" path: pack the canvas to a uint8 image the UI can blit
         # directly. If it can't be built on this backend we fall back to the old
@@ -238,9 +191,7 @@ class Engine:
         except Exception:
             self.presenter = None
         self.media_fx = MediaCompositor(self.canvas, self.media_field,
-                                        self.motion_field, self._prev_luma,
-                                        self.silhouette_field, self.flow_field,
-                                        self._mirror_buf)
+                                        self.motion_field, self._prev_luma)
         # frame feedback (infinite tunnels / spirals / echoes) — a post-pass
         # that recursively blends the previous composited frame back in.
         self.feedback = Feedback(width, height, self.canvas)
@@ -290,9 +241,6 @@ class Engine:
         # media fields are stable refs effects can sample any time
         self.ctx.media = self.media_field
         self.ctx.media_motion = self.motion_field
-        self.ctx.silhouette = self.silhouette_field
-        self.ctx.flow = self.flow_field
-        self.ctx.has_silhouette = False
         self._media_cleared = True
         self.store = ParamStore()
         if self.media is not None:
@@ -849,7 +797,6 @@ class Engine:
                 self._render_and_blend_layers(feats, signals)  # stack over main fx
                 self._apply_feedback()                          # tunnels / spirals / echoes
                 self._composite_media()
-                self._composite_mirror()                        # "Become the Visual"
                 if self._fx_active:        # shapes showing other effects -> draw them
                     self._render_secondary(feats, signals)
                 self._composite_shapes()   # shapes interact with the final image
@@ -902,42 +849,6 @@ class Engine:
         self.media_fx.update_motion(6.0, 0.85)
         self.ctx.has_media = True
         self._media_cleared = False
-        self._update_mirror()
-
-    def _update_mirror(self):
-        """Upload the silhouette + optical-flow fields for 'Become the Visual'.
-        Only computes CV in the camera thread while a mirror mode is active."""
-        self.ctx.has_silhouette = False
-        on = self.ctx.p.get("mirror", "Off") != "Off"
-        self.media.set_interactive(on)
-        if not on:
-            return
-        mask = self.media.mask()
-        flow = self.media.flow()
-        if mask is None or mask.shape != (self.h, self.w):
-            return
-        # (H,W) image -> field[x,y] (x right, y up), matching the media frame
-        self.silhouette_field.from_numpy(np.ascontiguousarray(
-            np.transpose(np.flipud(mask), (1, 0)).astype(np.float32)))
-        if flow is not None and flow.shape == (self.h, self.w, 2):
-            f = np.flipud(flow).copy()
-            f[..., 1] = -f[..., 1]          # y flips with flipud -> negate it
-            self.flow_field.from_numpy(np.ascontiguousarray(
-                np.transpose(f, (1, 0, 2)).astype(np.float32)))
-        else:
-            self.flow_field.fill(0)
-        self.ctx.has_silhouette = True
-
-    def _composite_mirror(self):
-        """'Become the Visual': flow-push and/or silhouette-mask the canvas."""
-        if self.media is None or not self.ctx.has_silhouette:
-            return
-        mode = self.ctx.p.get("mirror", "Off")
-        if mode in ("Push by motion", "Both"):
-            self.media_fx.push_save()
-            self.media_fx.push(float(self.ctx.p.get("mirror_push", 0.4)))
-        if mode in ("Become the effect", "Both"):
-            self.media_fx.become(float(self.ctx.p.get("mirror_bg", 0.0)))
 
     def _composite_shapes(self):
         """Draw the shape elements as a layer that interacts with the effect.

@@ -9,6 +9,29 @@ you want more, drop a Python file in `effects/` and it shows up automatically.
 > controls, audio reactivity, color system, and post-FX are all in place, with
 > two example effects (Liquid Fractal, Plasma).
 
+## 🦠 The Living Organism — music as a lifeform (the signature)
+
+Pick the **Living Organism** effect. It isn't a pattern that *reacts* to sound —
+it's a creature that *lives* on it. Under the hood it's a reaction–diffusion
+simulation (two chemicals diffusing and reacting on the GPU); from two numbers it
+grows coral, cells, fingerprints and mitosis — forms nobody designs and that
+**never repeat**.
+
+Your music is its metabolism:
+
+- the **beat** is a heartbeat — each one seeds new growth somewhere new,
+- **bass** feeds it (appetite = growth),
+- **highs** agitate it into fine filigree,
+- **Life** (driven by the Music Director's *Intensity*) is its lifeforce: it's
+  born sparse, **blooms** through the song's peak, and **recedes — dies** — in the
+  quiet. Pull *Life*'s base knob to 0 for a true birth→death arc that ends with
+  the track.
+- loud moments leave permanent **scars** — the organism *remembers* the song.
+
+Every play is a one-of-a-kind life that can never be reproduced. That's the hook:
+**no two are ever the same — show me yours.** Pure simulation, fed by your music —
+no generative AI, no extra installs.
+
 ## Run it
 
 ```bash
@@ -68,8 +91,11 @@ Your whole setup is saved state, not throwaway:
 
 In the panels you can:
 - Switch **effect** from the dropdown.
-- Choose an **audio source**: System (whatever's playing on your PC), Mic,
-  a music **File**, or Off.
+- Choose an **audio source**: **System** — visualize whatever's playing on
+  your PC (Spotify, YouTube, a DAW…) via output loopback; **Mic**; a music
+  **File**; or Off. With System, use **System out:** to point Eyenips at the
+  exact output your music uses (essential if you have more than one), and the
+  status line tells you whether it's `▶ playing` or just silent.
 - Tweak the effect's own knobs (speed, size, swirl, …).
 - Set the **look**: trails, fluid blur, grain, flicker, fade-in, brightness,
   and **feedback** (tunnels / spirals — see below).
@@ -216,27 +242,6 @@ are normal knobs, so they're **audio-drivable** (e.g. Media opacity ← Beat).
 Needs `opencv-python`; without it the Media section is hidden and everything
 else works.
 
-### 🪞 Become the Visual — *you* are the art (interactive, no AI)
-
-Point your webcam at yourself and **you get rendered as the effect** — not a
-backdrop, *you*. In the Media panel, turn the **Camera** on and pick a
-**🪞 Become the Visual** mode:
-
-- **Become the effect** — the effect plays *inside your silhouette*. You're made
-  of fire. You're made of plasma. (Click **Reset background**, stand still a
-  second so it learns the empty room, then move — you light up.)
-- **Push by motion** — your movement *shoves the visual around*; wave a hand and
-  the image flows away from it.
-- **Both** — you're made of light *and* it flows as you move.
-
-It's pure OpenCV — background subtraction for the silhouette, dense optical flow
-for the motion — **no AI, no extra installs**. Two knobs (**Motion push**,
-**Show me**) live in Parameters, so they're audio/LFO/**Intensity**-drivable too.
-
-Now combine it with the Music Director: **you, made of fire, dancing — and the
-fire explodes on the drop.** That's the clip worth filming. Point a phone at the
-screen, post it.
-
 ### Shapes (elements) — objects that *interact* with your effect
 
 Shapes are a **layer that sits on top of whatever effect is running and changes
@@ -332,8 +337,7 @@ vizstudio/
   effect.py     Effect base class + Context (what every effect receives)
   color.py      palette specs -> a 256-entry RGB lookup table the GPU samples
   audio.py      capture (system/mic/file) -> FFT -> bass/mid/treble/volume/beat
-  media.py      camera / image / video input -> a frame the engine composites;
-                also silhouette + optical flow for "Become the Visual" (OpenCV)
+  media.py      camera / image / video input -> a frame the engine composites
   midi.py       MIDI input (optional): maps controllers to the MIDI 1-8 drivers
   tempo.py      beat clock: tempo + bar/beat grid -> musical-time drive sources
                 (Bar / 1-4 note / Beat pulse …)

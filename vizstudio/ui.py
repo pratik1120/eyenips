@@ -923,15 +923,11 @@ class ControlPanel:
                     self.audio_status.config(text=self.engine.audio.status)
                 if self.engine.media and hasattr(self, "media_status"):
                     self.media_status.config(text=self.engine.media.status)
-                # keep the Media 'Show' + Become-the-Visual dropdowns in sync
+                # keep the Media 'Show' dropdown in sync with the store
                 if getattr(self, "media_show", None) is not None:
                     v = self.engine.store.values.get("media_blend", "Off")
                     if v != self.media_show.get():
                         self.media_show.set(v)
-                if getattr(self, "mirror_var", None) is not None:
-                    v = self.engine.store.values.get("mirror", "Off")
-                    if v != self.mirror_var.get():
-                        self.mirror_var.set(v)
             # live MIDI read-outs (assigned CC + value / learning) when shown
             if self._pump_count % 6 == 0 and getattr(self, "_midi_rows", None):
                 self._refresh_midi()
@@ -1090,30 +1086,6 @@ class ControlPanel:
                  "build an effect in ✎ Create Effect with Output = Texture/Warp.",
                  fg="#888", wraplength=380, justify="left").pack(anchor="w")
 
-        # --- 🪞 Become the Visual (interactive art) ---
-        mir = tk.LabelFrame(box, text="🪞 Become the Visual", padx=6, pady=3)
-        mir.pack(fill="x", pady=(6, 2))
-        r = tk.Frame(mir); r.pack(fill="x")
-        tk.Label(r, text="Mode").pack(side="left")
-        self.mirror_var = tk.StringVar(value=self.engine.store.values.get("mirror", "Off"))
-        cb = ttk.Combobox(r, textvariable=self.mirror_var, width=18, state="readonly",
-                          values=["Off", "Become the effect", "Push by motion", "Both"])
-        cb.pack(side="left", padx=3)
-        cb.bind("<<ComboboxSelected>>",
-                lambda e: self.engine.store.set("mirror", self.mirror_var.get()))
-        tk.Button(r, text="Reset background", command=self._reset_background).pack(side="left", padx=4)
-        tk.Label(mir, text="Turn the Camera on, then BECOME the effect — it renders "
-                 "inside your silhouette (you're made of fire/plasma), and your "
-                 "motion pushes it. Stand still a sec after 'Reset background'. "
-                 "Tune Motion push / Show-me in Parameters.",
-                 fg="#888", wraplength=360, justify="left").pack(anchor="w")
-
-    def _reset_background(self):
-        """Re-learn the empty scene for the silhouette (step out, click, step in)."""
-        if self.engine.media is not None:
-            self.engine.media.reset_background()
-            self._set_status("Background reset — stand still a moment, then move.")
-
     def _on_media_mode(self):
         mode = self.media_mode.get()
         if mode in ("image", "video"):
@@ -1150,7 +1122,7 @@ class ControlPanel:
                 self.media_show.set("Behind")
             self.media_status.config(
                 text=f"{self.engine.media.status} — showing as backdrop. Change "
-                     "'Show' to mix it, or try 🪞 Become the Visual.", fg="#06c")
+                     "'Show' to mix it with the effect.", fg="#06c")
         else:
             self.media_status.config(text=self.engine.media.status, fg="#06c")
 
@@ -1165,6 +1137,23 @@ class ControlPanel:
                             ("File", "file"), ("Off", "none")]:
             tk.Radiobutton(row, text=label, variable=self.audio_mode, value=mode,
                            command=self._on_audio_mode).pack(side="left")
+
+        # System = visualize whatever's playing on the PC (Spotify, YouTube, a
+        # DAW…). With several outputs we MUST point at the right one or it's
+        # black; this picker is what makes the loopback path actually usable.
+        sysrow = tk.Frame(box); sysrow.pack(fill="x", pady=(2, 0))
+        tk.Label(sysrow, text="System out:").pack(side="left")
+        outs = self.engine.audio.list_outputs() if self.engine.audio else []
+        self.sys_device_var = tk.StringVar(value=outs[0] if outs else "")
+        self.sys_device_menu = ttk.Combobox(
+            sysrow, textvariable=self.sys_device_var, values=outs,
+            state="readonly", width=22)
+        self.sys_device_menu.pack(side="left", padx=(3, 0))
+        self.sys_device_menu.bind("<<ComboboxSelected>>", self._on_sys_device)
+        tk.Label(box, text="“System” shows whatever is playing on this PC. "
+                           "Pick the output your music actually uses.",
+                 fg="#888", wraplength=240, justify="left", font=("", 7)
+                 ).pack(anchor="w")
 
         tk.Button(box, text="Load audio file…", command=self._pick_file).pack(
             anchor="w", pady=(4, 0))
@@ -1300,8 +1289,16 @@ class ControlPanel:
         mode = self.audio_mode.get()
         if mode == "file":
             self._pick_file()
+        elif mode == "system":
+            dev = getattr(self, "sys_device_var", None)
+            self.engine.audio.set_mode("system", device=dev.get() if dev else None)
         else:
             self.engine.audio.set_mode(mode)
+
+    def _on_sys_device(self, _evt=None):
+        """Chose a different output to loop back; re-open if System is live."""
+        if self.audio_mode.get() == "system":
+            self.engine.audio.set_mode("system", device=self.sys_device_var.get())
 
     def _on_effect_change(self, _evt=None):
         name = self.effect_var.get()
@@ -1344,6 +1341,7 @@ class ControlPanel:
             "mode": self.audio_mode.get() if hasattr(self, "audio_mode") else "system",
             "gain": float(self.gain.get()) if hasattr(self, "gain") else 1.0,
             "file": self._loaded_audio,
+            "device": self.sys_device_var.get() if hasattr(self, "sys_device_var") else "",
         }
         if hasattr(self, "media_mode"):
             st["media"] = {"mode": self.media_mode.get(), "path": self._media_path}
@@ -1400,16 +1398,24 @@ class ControlPanel:
         mode = a.get("mode", "system")
         gain = float(a.get("gain", 1.0))
         f = a.get("file")
+        dev = a.get("device") or ""
         if hasattr(self, "audio_mode"):
             self.audio_mode.set(mode)
         if hasattr(self, "gain"):
             self.gain.set(gain)
+        # restore the saved output device if it's still present
+        if dev and hasattr(self, "sys_device_menu"):
+            if dev in self.sys_device_menu.cget("values"):
+                self.sys_device_var.set(dev)
         if self.engine.audio:
             self.engine.audio.set_gain(gain)
             if mode == "file" and f and os.path.exists(f):
                 self._loaded_audio = f
                 self.engine.audio.set_mode("file", f)
                 self.engine.analyze_track(f)        # re-map the song for the Director
+            elif mode == "system":
+                self.engine.audio.set_mode("system", device=self.sys_device_var.get()
+                                           if hasattr(self, "sys_device_var") else None)
             else:
                 self.engine.audio.set_mode("none" if mode == "file" else mode)
 
@@ -1494,8 +1500,13 @@ class ControlPanel:
         if os.path.exists(self._session_path):
             try:
                 self._apply_state(project.load(self._session_path))
+                return
             except Exception as e:
                 print(f"[session] could not restore: {e}")
+        # fresh launch: start the default source so "System" works on day one
+        # (loopback is silent until something plays — no harm, instant payoff)
+        if self.engine.audio and self.audio_mode.get() != "none":
+            self._on_audio_mode()
 
     # ---- undo / redo (coalesced state history) -------------------------
     def _init_history(self):
