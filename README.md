@@ -44,6 +44,29 @@ effects:
 Any Python effect can read the same data and composite over `ctx.media` — and it
 all renders out through **🎬 Export VIDEO** (below).
 
+## 🎞 Video Lab — a million content-aware video effects
+
+What Effect Lab does for visualizers, **Video Lab** does for *video effects*. Load
+a clip and every **Recipe** is a different way of operating on the footage — and
+crucially it's **not** "transform A glued to overlay B." A Recipe is a *continuous
+blend* of many operators, each present to its own random degree (2–4 dominant + a
+couple of subtle accents, the rest off), so it reads as one organic effect, not a
+combination:
+
+- **warp the sampling:** flow-melt (the video smears along its own motion) ·
+  swirl · wave · noise-warp · kaleidoscope · mirror · tile — each `0..1`,
+- **restyle the color:** chromatic split · neon edges · posterize · duotone ·
+  invert — each `0..1`,
+- **augment from motion:** blob halos · sparks · trails · constellation ·
+  flow-glow — each `0..1`.
+
+So one Recipe is "70% melt + a little swirl + 30% kaleidoscope, 20% duotone,
+trails at 0.6" and the next is something else entirely. **Millions of content-aware
+video effects** — the kind nobody has, because nobody hand-writes a million of
+them (people ship three or four). Spin **Recipe** / **🎲 Randomize**, keep the
+**Footage** knob up to preserve the clip's essence, and **🎬 Export VIDEO** the
+result. Pure math + OpenCV motion; no AI.
+
 ## 🦠 The Living Organism — music as a lifeform (a signature)
 
 Pick the **Living Organism** effect. It isn't a pattern that *reacts* to sound —

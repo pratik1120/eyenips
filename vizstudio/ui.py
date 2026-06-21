@@ -1232,6 +1232,7 @@ class ControlPanel:
         val = random.randint(int(target.lo), int(target.hi))
         self.engine.store.set(target.name, val)
         self._build_params()                      # reflect the new value on the knob
+        self.apply_theme(self.theme_var.get())    # fresh widgets need the theme re-applied
         self._set_status(f"🎲 Recipe {val}")
 
     def _build_export_section(self, parent):
