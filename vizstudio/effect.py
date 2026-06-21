@@ -43,6 +43,19 @@ class Context:
         self.media = None           # ti.Vector.field(3) shape (W,H): current frame
         self.media_motion = None    # ti.field(f32) shape (W,H): camera motion 0..1
         self.has_media = False      # is a media source currently producing frames?
+        # video ANALYSIS (for content-aware "video effects"). Populated only when
+        # the active effect sets `uses_video = True` and a video/camera is live:
+        self.flow = None            # ti.Vector.field(2) shape (W,H): optical flow
+        self.blobs = None           # ti.field(f32) shape (MAX_BLOBS,5): tracked
+                                    #   moving regions [x,y,radius,vx,vy], canvas
+                                    #   coords (0..1, y up)
+        self.n_blobs = 0            # how many entries in `blobs` are live this frame
+        self.max_blobs = 0          # capacity of the blobs field
+        self.has_video = False      # is video analysis available this frame?
+        # live pointer: lets an effect be INTERACTIVE (the mouse over the preview).
+        # None in headless/export; otherwise a Pointer with x/y in 0..1 (y up to
+        # match the canvas), dx/dy per-frame velocity, down (button), active (over).
+        self.pointer = None
 
 
 class Effect:

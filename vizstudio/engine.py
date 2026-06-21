@@ -21,7 +21,7 @@ from . import shapes as shapelib
 from .effect import Context
 from .params import Slider, ColorPalette
 from .postfx import PostFX, Feedback, global_params
-from .media import media_params, BLEND_IDS
+from .media import media_params, BLEND_IDS, MAX_BLOBS
 from .shapes_fx import ShapesCompositor
 from .modulation import ModEngine
 from .midi import MidiEngine
@@ -147,6 +147,26 @@ class MediaCompositor:
             self.canvas[i, j] = out
 
 
+class Pointer:
+    """The live mouse over the preview, so effects can be interactive. Coords are
+    normalized 0..1 with y UP (matching the canvas); dx/dy are per-frame velocity."""
+    __slots__ = ("x", "y", "dx", "dy", "down", "active", "_px", "_py")
+
+    def __init__(self):
+        self.x = self.y = 0.5
+        self.dx = self.dy = 0.0
+        self.down = False
+        self.active = False
+        self._px = self._py = 0.5
+
+    def tick(self):
+        """Called once per frame by the engine to compute velocity from motion."""
+        self.dx = self.x - self._px
+        self.dy = self.y - self._py
+        self._px = self.x
+        self._py = self.y
+
+
 @ti.data_oriented
 class Presenter:
     """Packs the final float canvas into an image-oriented uint8 RGB buffer on
@@ -241,6 +261,15 @@ class Engine:
         # media fields are stable refs effects can sample any time
         self.ctx.media = self.media_field
         self.ctx.media_motion = self.motion_field
+        # video analysis fields (optical flow + tracked blobs) for "video effects"
+        self.flow_field = ti.Vector.field(2, ti.f32, shape=(width, height))
+        self.blob_field = ti.field(ti.f32, shape=(MAX_BLOBS, 5))
+        self.ctx.flow = self.flow_field
+        self.ctx.blobs = self.blob_field
+        self.ctx.max_blobs = MAX_BLOBS
+        # live pointer (the mouse over the preview) -> interactive effects
+        self.pointer = Pointer()
+        self.ctx.pointer = self.pointer
         self._media_cleared = True
         self.store = ParamStore()
         if self.media is not None:
@@ -775,9 +804,11 @@ class Engine:
             # auto-pilot: steer params + fire scene changes from the song map
             self.director.apply(self, self.ctx.p, dsig)
             self._upload_palette()
+            self.pointer.tick()        # per-frame mouse velocity for interactive fx
 
             if not self.paused:
                 self._update_media()   # refresh media+motion so effects can sample
+                self._update_video()   # optical flow + blobs for video effects
 
                 # trails: fade old frame instead of full clear
                 if self.ctx.p.get("trails"):
@@ -850,6 +881,34 @@ class Engine:
         self.ctx.has_media = True
         self._media_cleared = False
 
+    def _update_video(self):
+        """Run/stop video analysis and upload flow + tracked blobs so a video
+        effect can read ctx.flow / ctx.blobs. Only active when the current effect
+        opts in (`uses_video = True`) and a video/camera is producing frames."""
+        self.ctx.has_video = False
+        self.ctx.n_blobs = 0
+        if self.media is None:
+            return
+        wants = self.ctx.has_media and bool(getattr(self.effect, "uses_video", False))
+        self.media.set_analyze(wants)
+        if not wants:
+            return
+        flow = self.media.flow()
+        if flow is not None and flow.shape == (self.h, self.w, 2):
+            f = np.flipud(flow).copy()
+            f[..., 1] = -f[..., 1]              # y flips with flipud -> negate it
+            self.flow_field.from_numpy(np.ascontiguousarray(
+                np.transpose(f, (1, 0, 2)).astype(np.float32)))
+        else:
+            self.flow_field.fill(0)
+        blobs, n = self.media.blobs()
+        conv = blobs.copy()                     # image coords (y down) -> canvas (y up)
+        conv[:, 1] = 1.0 - conv[:, 1]
+        conv[:, 4] = -conv[:, 4]
+        self.blob_field.from_numpy(np.ascontiguousarray(conv.astype(np.float32)))
+        self.ctx.n_blobs = int(n)
+        self.ctx.has_video = True
+
     def _composite_shapes(self):
         """Draw the shape elements as a layer that interacts with the effect.
         Skipped entirely when there are no shapes (zero cost)."""
@@ -883,16 +942,29 @@ class Engine:
                                 float(self.ctx.p.get("media_brightness", 1.0)))
 
     def _do_export(self, cfg):
-        from .export import export_mp4
         # pause live audio so it doesn't fight the offline analyzer / CPU
         was_mode = self.audio._mode if self.audio else "none"
         was_file = self.audio.current_file() if self.audio else None
         if self.audio:
             self.audio.stop()
-        ok, msg = export_mp4(
-            self, cfg["audio_path"], cfg["out_path"],
-            fps=cfg.get("fps", 30), seconds=cfg.get("seconds"),
-            progress=cfg.get("progress"))
+        if cfg.get("video_path"):
+            # render-through-video: run the effect OVER the input clip
+            from .export import export_video
+            was_media = self.media._mode if self.media else "off"
+            was_media_path = getattr(self.media, "_path", None) if self.media else None
+            if self.media:
+                self.media.stop()                  # free the file + CPU
+            ok, msg = export_video(
+                self, cfg["video_path"], cfg["out_path"],
+                seconds=cfg.get("seconds"), progress=cfg.get("progress"))
+            if self.media and was_media in ("camera", "video"):
+                self.media.set_mode(was_media, was_media_path)
+        else:
+            from .export import export_mp4
+            ok, msg = export_mp4(
+                self, cfg["audio_path"], cfg["out_path"],
+                fps=cfg.get("fps", 30), seconds=cfg.get("seconds"),
+                progress=cfg.get("progress"))
         cfg.get("done", lambda *_: None)(ok, msg)
         if self.audio and was_mode != "none":
             self.audio.set_mode(was_mode, was_file)

@@ -43,8 +43,10 @@ class AudioFeatures:
         self.hihat = 0.0
         self.spectrum = np.zeros(64, dtype=np.float32)
 
-    def get(self, source):
-        """Look up a feature by name (used to drive knobs)."""
+    def get(self, source, default=0.0):
+        """Look up a feature by name (used to drive knobs). Accepts a default so
+        an AudioFeatures can stand in for the live `signals` dict during export
+        (non-audio sources — LFOs, Director… — resolve to the default)."""
         if source == "volume": return self.volume
         if source == "bass":   return self.bass
         if source == "mid":    return self.mid
@@ -53,7 +55,7 @@ class AudioFeatures:
         if source == "kick":   return self.kick
         if source == "snare":  return self.snare
         if source == "hihat":  return self.hihat
-        return 0.0
+        return default
 
 
 def _band_energy(mag, freqs, lo, hi):

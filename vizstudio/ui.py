@@ -161,6 +161,13 @@ class ControlPanel:
         # click / drag the preview to place the selected shape
         self.preview.bind("<Button-1>", self._place_selected)
         self.preview.bind("<B1-Motion>", self._place_selected)
+        # feed the mouse to the engine so effects can be INTERACTIVE (e.g. stir
+        # the fluid). add="+" so this coexists with shape-placing above.
+        self.preview.bind("<Motion>", lambda e: self._update_pointer(e, down=False), add="+")
+        self.preview.bind("<Button-1>", lambda e: self._update_pointer(e, down=True), add="+")
+        self.preview.bind("<B1-Motion>", lambda e: self._update_pointer(e, down=True), add="+")
+        self.preview.bind("<ButtonRelease-1>", lambda e: self._update_pointer(e, down=False), add="+")
+        self.preview.bind("<Leave>", lambda e: self._pointer_leave(), add="+")
         main.add(center, stretch="always", minsize=380)
 
         right = tk.Frame(main, width=400)
@@ -1207,9 +1214,25 @@ class ControlPanel:
 
         btns = tk.Frame(box); btns.pack(fill="x", pady=(4, 0))
         tk.Button(btns, text="Reset effect", command=self._reset).pack(side="left")
+        tk.Button(btns, text="🎲 Randomize", command=self._randomize_recipe).pack(side="left", padx=6)
         tk.Button(btns, text="✨ Shapes…", command=self._open_shapes).pack(side="left", padx=6)
         tk.Button(btns, text="🧱 Layers…", command=self._open_layers).pack(side="left", padx=6)
         tk.Button(btns, text="✎ Create Effect…", command=self._goto_create).pack(side="left", padx=6)
+
+    def _randomize_recipe(self):
+        """Roll a new Recipe for a generative effect (Effect Lab) — a fresh effect
+        from its millions, one click. No-op (with a hint) for fixed effects."""
+        import random
+        target = next((p for p in self.engine.params
+                       if isinstance(p, IntSlider) and p.name in ("recipe", "seed")), None)
+        if target is None:
+            self._set_status("This effect has no Recipe to randomize "
+                             "(try the Effect Lab).")
+            return
+        val = random.randint(int(target.lo), int(target.hi))
+        self.engine.store.set(target.name, val)
+        self._build_params()                      # reflect the new value on the knob
+        self._set_status(f"🎲 Recipe {val}")
 
     def _build_export_section(self, parent):
         box = tk.Frame(parent, padx=8, pady=4)
@@ -1223,11 +1246,53 @@ class ControlPanel:
         self.secs_var = tk.StringVar(value="")
         tk.Entry(row, textvariable=self.secs_var, width=6).pack(side="left", padx=2)
 
-        tk.Button(box, text="Export MP4…", command=self._on_export).pack(
-            anchor="w", pady=(4, 0))
-        self.export_status = tk.Label(box, text="Uses your current effect, knobs & colors.",
+        brow = tk.Frame(box); brow.pack(fill="x", pady=(4, 0))
+        tk.Button(brow, text="Export MP4 (audio)…", command=self._on_export).pack(side="left")
+        tk.Button(brow, text="🎬 Export VIDEO…", command=self._on_export_video).pack(
+            side="left", padx=6)
+        self.export_status = tk.Label(box, text="“Export MP4” renders the effect to your "
+                                      "audio. “Export VIDEO” runs the effect OVER a video "
+                                      "clip (e.g. Blob Tracker) and bakes in the result.",
                                       fg="#888", wraplength=380, justify="left")
         self.export_status.pack(anchor="w")
+
+    def _on_export_video(self):
+        """Render-through-video: run the current effect over an input clip."""
+        video_path = (self.engine.media._path if self.engine.media
+                      and self.engine.media._mode == "video" else None)
+        video_path = video_path or getattr(self, "_media_path", None)
+        if not (video_path and os.path.exists(video_path)):
+            video_path = filedialog.askopenfilename(
+                title="Choose the video to run the effect over",
+                filetypes=[("Video", "*.mp4 *.mov *.avi *.mkv *.webm"), ("All", "*.*")])
+        if not video_path:
+            self.export_status.config(text="Video export cancelled (no clip chosen).", fg="#a00")
+            return
+        out_path = filedialog.asksaveasfilename(
+            title="Save augmented video as", defaultextension=".mp4",
+            filetypes=[("MP4 video", "*.mp4")])
+        if not out_path:
+            return
+        try:
+            seconds = float(self.secs_var.get()) if self.secs_var.get().strip() else None
+        except ValueError:
+            seconds = None
+
+        def progress(done, total, msg):
+            self.export_status.config(text=f"{msg}  ({100*done//total}%)", fg="#06c")
+            try:
+                self.root.update()
+            except tk.TclError:
+                pass
+
+        def finished(ok, msg):
+            self.export_status.config(text=msg, fg="#070" if ok else "#a00")
+
+        self.export_status.config(text="Starting video export…", fg="#06c")
+        self.engine.request_export({
+            "video_path": video_path, "out_path": out_path,
+            "seconds": seconds, "progress": progress, "done": finished,
+        })
 
     def _on_export(self):
         # 1) need an audio file to embed (system/mic are live - nothing to bake)
@@ -2126,6 +2191,26 @@ class ControlPanel:
         self._params_grid(host, d["params"], d["store"], scroll=True)
         if getattr(self, "_theme", None):
             self.apply_theme(self.theme_var.get())
+
+    def _update_pointer(self, event, down=None):
+        """Feed the mouse over the preview into the engine pointer (normalized,
+        y-up to match the canvas), so interactive effects can read it."""
+        rect = getattr(self, "_img_rect", None)
+        pt = getattr(self.engine, "pointer", None)
+        if not rect or pt is None:
+            return
+        offx, offy, dw, dh = rect
+        pt.x = min(1.0, max(0.0, (event.x - offx) / dw))
+        pt.y = min(1.0, max(0.0, 1.0 - (event.y - offy) / dh))
+        pt.active = True
+        if down is not None:
+            pt.down = down
+
+    def _pointer_leave(self):
+        pt = getattr(self.engine, "pointer", None)
+        if pt is not None:
+            pt.active = False
+            pt.down = False
 
     def _place_selected(self, event):
         """Click/drag on the preview -> move the selected shape there. Acts only
