@@ -1251,11 +1251,28 @@ class ControlPanel:
         tk.Button(brow, text="Export MP4 (audio)…", command=self._on_export).pack(side="left")
         tk.Button(brow, text="🎬 Export VIDEO…", command=self._on_export_video).pack(
             side="left", padx=6)
+        self.stop_export_btn = tk.Button(brow, text="■ Stop", command=self._stop_export,
+                                         state="disabled")
+        self.stop_export_btn.pack(side="left", padx=6)
         self.export_status = tk.Label(box, text="“Export MP4” renders the effect to your "
                                       "audio. “Export VIDEO” runs the effect OVER a video "
-                                      "clip (e.g. Blob Tracker) and bakes in the result.",
+                                      "clip (e.g. Video Lab) and bakes in the result. Use "
+                                      "“■ Stop” to end a render early (keeps what's done).",
                                       fg="#888", wraplength=380, justify="left")
         self.export_status.pack(anchor="w")
+
+    def _stop_export(self):
+        if self.engine:
+            self.engine.cancel_export()
+            self.export_status.config(text="Stopping…", fg="#a60")
+
+    def _export_running(self, on):
+        """Enable the Stop button only while a render is in flight."""
+        if getattr(self, "stop_export_btn", None) is not None:
+            try:
+                self.stop_export_btn.config(state="normal" if on else "disabled")
+            except tk.TclError:
+                pass
 
     def _on_export_video(self):
         """Render-through-video: run the current effect over an input clip."""
@@ -1288,8 +1305,10 @@ class ControlPanel:
 
         def finished(ok, msg):
             self.export_status.config(text=msg, fg="#070" if ok else "#a00")
+            self._export_running(False)
 
         self.export_status.config(text="Starting video export…", fg="#06c")
+        self._export_running(True)
         self.engine.request_export({
             "video_path": video_path, "out_path": out_path,
             "seconds": seconds, "progress": progress, "done": finished,
@@ -1332,8 +1351,10 @@ class ControlPanel:
 
         def finished(ok, msg):
             self.export_status.config(text=msg, fg="#070" if ok else "#a00")
+            self._export_running(False)
 
         self.export_status.config(text="Starting export…", fg="#06c")
+        self._export_running(True)
         self.engine.request_export({
             "audio_path": audio_path, "out_path": out_path,
             "fps": fps, "seconds": seconds,

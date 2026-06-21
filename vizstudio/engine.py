@@ -281,6 +281,7 @@ class Engine:
         self._pending_effect = None
         self._pending_reset = False
         self._pending_export = None
+        self._export_cancel = False    # set by cancel_export() to stop a render
         self._pending_expr = None
         self._pending_shapes = False  # shape array changed -> re-upload
         self.effect_error = ""     # last error from a (user) effect, for the UI
@@ -329,7 +330,13 @@ class Engine:
 
     def request_export(self, config):
         """config: dict(audio_path, out_path, fps, seconds, progress)."""
+        self._export_cancel = False
         self._pending_export = config
+
+    def cancel_export(self):
+        """Ask the running export to stop after the current frame (safe to call
+        any time; the export loop checks this flag each frame)."""
+        self._export_cancel = True
 
     def apply_expression(self, bright, hue, source=None):
         """Live-update the active expression effect's formulas (engine thread)."""
@@ -588,8 +595,7 @@ class Engine:
                 store = ParamStore(); store.load(params)
                 self._fx_store_cache[key] = store
             ctx = Context(self.w, self.h, buf, pal)
-            ctx.media = self.media_field
-            ctx.media_motion = self.motion_field
+            self._wire_inputs(ctx)
             try:
                 inst.setup(ctx)
             except Exception as e:
@@ -621,6 +627,17 @@ class Engine:
             d["pal"].from_numpy(color.build_lut(spec).astype(np.float32))
             d["palkey"] = key
 
+    def _wire_inputs(self, ctx):
+        """Give a sub-context (a layer / secondary effect) the SAME input fields
+        the main context has, so a video effect works there too (it reads
+        ctx.media / ctx.flow / ctx.blobs / ctx.pointer just like the main one)."""
+        ctx.media = self.media_field
+        ctx.media_motion = self.motion_field
+        ctx.flow = self.flow_field
+        ctx.blobs = self.blob_field
+        ctx.max_blobs = MAX_BLOBS
+        ctx.pointer = self.pointer
+
     def _render_secondary(self, feats, signals):
         """Render each secondary effect (its own knobs + look post-FX + palette)
         into its buffer so window-shapes can sample it."""
@@ -630,6 +647,7 @@ class Engine:
             c.time = self.ctx.time; c.dt = self.ctx.dt; c.frame = self.ctx.frame
             c.audio = feats
             c.has_media = self.ctx.has_media
+            c.has_video = self.ctx.has_video; c.n_blobs = self.ctx.n_blobs
             c.p = self._resolve_store(d["store"], signals)
             if c.p.get("trails"):
                 d["postfx"].decay(float(c.p.get("trail_length", 0.9)))
@@ -690,8 +708,7 @@ class Engine:
                 store = ParamStore(); store.load(params)
                 self._layer_store_cache[key] = store
             ctx = Context(self.w, self.h, buf, pal)
-            ctx.media = self.media_field
-            ctx.media_motion = self.motion_field
+            self._wire_inputs(ctx)
             try:
                 inst.setup(ctx)
             except Exception as e:
@@ -725,6 +742,7 @@ class Engine:
             c.time = self.ctx.time; c.dt = self.ctx.dt; c.frame = self.ctx.frame
             c.audio = feats
             c.has_media = self.ctx.has_media
+            c.has_video = self.ctx.has_video; c.n_blobs = self.ctx.n_blobs
             c.p = self._resolve_store(d["store"], signals)
             if c.p.get("trails"):
                 d["postfx"].decay(float(c.p.get("trail_length", 0.9)))
@@ -917,6 +935,32 @@ class Engine:
         self.shapes_fx.run(self.ctx.time,
                            float(self.ctx.p.get("shapes_gain", 1.0)),
                            self.ctx.audio)
+
+    def reset_render_state(self):
+        """Clear ALL transient visual accumulation so a fresh render (e.g. an
+        export) starts from a clean first frame instead of inheriting the live
+        session's mid-animation buildup: the main effect, the feedback buffer
+        (tunnels/spirals/echoes), and every layer / secondary effect's own state
+        and trail buffer. Call after the layer/secondary stacks are reconciled."""
+        if self.effect:
+            try:
+                self.effect.reset()
+            except Exception:
+                pass
+        self._clear_canvas()
+        self.feedback.clear()
+        for d in self._layers_active:
+            try:
+                d["inst"].reset()
+            except Exception:
+                pass
+            d["buf"].fill(0)
+        for d in self._fx_active.values():
+            try:
+                d["inst"].reset()
+            except Exception:
+                pass
+            d["buf"].fill(0)
 
     def _apply_feedback(self):
         """Recursively blend the previous composited frame back in (zoom/spin +

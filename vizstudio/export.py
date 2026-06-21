@@ -25,6 +25,32 @@ def _ffmpeg_exe():
     return imageio_ffmpeg.get_ffmpeg_exe()
 
 
+def _prime_agc(analyzer, mono, sr, fps):
+    """Pre-warm the analyzer's adaptive gain over the WHOLE track, then seed its
+    per-band peak with the track's global level. A fresh analyzer starts with a
+    tiny peak, so without this a quiet intro normalizes up to full energy and the
+    export opens like a mid-song drop instead of the calm start."""
+    if mono is None or mono.shape[0] < BLOCK:
+        return
+    step = max(1, int(round(sr / max(1.0, fps))))
+    peak = analyzer._peak.copy()
+    s = 0
+    n = mono.shape[0]
+    while s < n:
+        w = mono[s:s + BLOCK]
+        if w.shape[0] < BLOCK:
+            w = np.pad(w, (0, BLOCK - w.shape[0]))
+        analyzer._analyze(w.astype(np.float32))
+        peak = np.maximum(peak, analyzer._peak)
+        s += step
+    # seed the global peak; clear transient smoothing/beat state for a clean start
+    analyzer._peak = peak
+    analyzer._smooth[:] = 0.0
+    analyzer._band_ema[:] = 0.0
+    analyzer._bass_history[:] = 0.0
+    analyzer._beat_cooldown = 0
+
+
 def _extract_audio(path):
     """Pull a video/clip's audio to a temp mono wav (for analysis AND muxing).
     Returns the temp path, or None if there's no usable audio."""
@@ -104,6 +130,7 @@ def export_mp4(engine, audio_path, out_path, fps=30, seconds=None, progress=None
     analyzer = AudioEngine()
     analyzer._freqs = np.fft.rfftfreq(BLOCK, 1.0 / sr)
     analyzer.set_gain(engine.audio._gain if engine.audio else 1.0)
+    _prime_agc(analyzer, mono, sr, fps)     # so the quiet intro reads as the start
 
     ff = _ffmpeg_exe()
     cmd = [
@@ -137,13 +164,43 @@ def export_mp4(engine, audio_path, out_path, fps=30, seconds=None, progress=None
 
     effect = engine.effect
     ctx = engine.ctx
-    if effect:
-        effect.reset()
-    engine._clear_canvas()
+    if engine._layers_dirty:
+        engine._reconcile_layers()
+    if engine._fx_dirty:
+        engine._reconcile_secondary()
+    engine.reset_render_state()              # start from a CLEAN frame, not mid-buildup
     engine._upload_palette(force=True)
 
+    # If the media source is a VIDEO, drive it from the file IN SYNC with the
+    # export (from frame 0, looping) instead of the live real-time thread — which
+    # otherwise starts mid-clip and drifts ("video starts from the middle").
+    media_feeder, media_cap, media_orig = None, None, None
+    if (engine.media is not None and getattr(engine.media, "_mode", "off") == "video"
+            and getattr(engine.media, "_path", None)):
+        import cv2
+        media_cap = cv2.VideoCapture(engine.media._path)
+        if media_cap.isOpened():
+            media_feeder = _VideoFeeder(engine.w, engine.h)
+            media_orig = engine.media
+            engine.media = media_feeder
+        else:
+            media_cap.release()
+            media_cap = None
+
+    cancelled = False
+    f = 0
     try:
         for f in range(total_frames):
+            if engine._export_cancel:           # user hit Stop
+                cancelled = True
+                break
+            if media_feeder is not None:        # advance the media video, looping
+                ok, bgr = media_cap.read()
+                if not ok:
+                    media_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    ok, bgr = media_cap.read()
+                if ok:
+                    media_feeder.push(bgr)
             t = f / fps
             s = int(t * sr)
             window = mono[s:s + BLOCK]
@@ -164,10 +221,16 @@ def export_mp4(engine, audio_path, out_path, fps=30, seconds=None, progress=None
             else:
                 engine._clear_canvas()
             engine._update_media()      # so texture/warp effects sample media
+            engine._update_video()      # flow + blobs for video effects
             if effect:
                 effect.render(ctx)
             engine.postfx.apply(ctx.p, ctx.time)
+            engine._render_and_blend_layers(feats, feats)   # the layer stack
+            engine._apply_feedback()
             engine._composite_media()   # optional background blend
+            if engine._fx_active:
+                engine._render_secondary(feats, feats)
+            engine._composite_shapes()
 
             img = engine.canvas.to_numpy()
             np.clip(img, 0.0, 1.0, out=img)
@@ -189,6 +252,10 @@ def export_mp4(engine, audio_path, out_path, fps=30, seconds=None, progress=None
             except Exception:
                 pass
         proc.wait()
+        if media_cap is not None:
+            media_cap.release()
+        if media_orig is not None:
+            engine.media = media_orig       # restore the live media source
         if effect:
             effect.reset()      # restore clean state for the live view
         engine._clear_canvas()
@@ -197,6 +264,8 @@ def export_mp4(engine, audio_path, out_path, fps=30, seconds=None, progress=None
     log.close()
     if proc.returncode != 0:
         return False, f"ffmpeg exit {proc.returncode}:\n{tail}"
+    if cancelled:
+        return True, f"Stopped — saved {f} frames to {out_path}"
     return True, f"Saved {out_path}  ({total_frames} frames @ {fps}fps)"
 
 
@@ -235,6 +304,7 @@ def export_video(engine, video_path, out_path, seconds=None, progress=None):
             analyzer = AudioEngine()
             analyzer._freqs = np.fft.rfftfreq(BLOCK, 1.0 / sr)
             analyzer.set_gain(engine.audio._gain if engine.audio else 1.0)
+            _prime_agc(analyzer, mono, sr, vfps)   # quiet intro reads as the start
         except Exception:
             mono = None
 
@@ -272,14 +342,20 @@ def export_video(engine, video_path, out_path, seconds=None, progress=None):
     engine.media = feeder                    # drive the engine from the file
     effect = engine.effect
     ctx = engine.ctx
-    if effect:
-        effect.reset()
-    engine._clear_canvas()
+    if engine._layers_dirty:                 # make sure the layer / shape stacks
+        engine._reconcile_layers()           # are built before we reset/render them
+    if engine._fx_dirty:
+        engine._reconcile_secondary()
+    engine.reset_render_state()              # start from a CLEAN frame, not mid-buildup
     engine._upload_palette(force=True)
     silent = AudioFeatures()
+    cancelled = False
     f = 0
     try:
         while f < maxf:
+            if engine._export_cancel:           # user hit Stop
+                cancelled = True
+                break
             ok, bgr = cap.read()
             if not ok:
                 break
@@ -311,7 +387,12 @@ def export_video(engine, video_path, out_path, seconds=None, progress=None):
             if effect:
                 effect.render(ctx)
             engine.postfx.apply(ctx.p, ctx.time)
+            engine._render_and_blend_layers(feats, feats)   # the layer stack
+            engine._apply_feedback()
             engine._composite_media()        # honors media_blend if the user set it
+            if engine._fx_active:
+                engine._render_secondary(feats, feats)
+            engine._composite_shapes()
 
             img = engine.canvas.to_numpy()
             np.clip(img, 0.0, 1.0, out=img)
@@ -349,4 +430,6 @@ def export_video(engine, video_path, out_path, seconds=None, progress=None):
     log.close()
     if proc.returncode != 0:
         return False, f"ffmpeg exit {proc.returncode}:\n{tail}"
+    if cancelled:
+        return True, f"Stopped — saved {f} frames to {out_path}"
     return True, f"Saved {out_path}  ({f} frames @ {vfps:g}fps, from your video)"
