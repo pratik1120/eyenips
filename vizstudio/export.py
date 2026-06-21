@@ -89,6 +89,11 @@ class _VideoFeeder:
                 self._ms._compute_analysis(bgr)
             except Exception:
                 pass
+        if self._ms._want_mask:
+            try:
+                self._ms._compute_mask(bgr)
+            except Exception:
+                pass
 
     def frame(self):
         return self._frame
@@ -101,6 +106,12 @@ class _VideoFeeder:
 
     def set_analyze(self, on):
         self._ms.set_analyze(on)
+
+    def set_mask(self, on):
+        self._ms.set_mask(on)
+
+    def mask(self):
+        return self._ms.mask()
 
     def stop(self):
         pass
@@ -222,12 +233,14 @@ def export_mp4(engine, audio_path, out_path, fps=30, seconds=None, progress=None
                 engine._clear_canvas()
             engine._update_media()      # so texture/warp effects sample media
             engine._update_video()      # flow + blobs for video effects
+            engine._update_subject()    # person mask for 'effect behind subject'
             if effect:
                 effect.render(ctx)
             engine.postfx.apply(ctx.p, ctx.time)
             engine._render_and_blend_layers(feats, feats)   # the layer stack
             engine._apply_feedback()
             engine._composite_media()   # optional background blend
+            engine._composite_subject() # subject in front of the effect/layers
             if engine._fx_active:
                 engine._render_secondary(feats, feats)
             engine._composite_shapes()
@@ -384,12 +397,14 @@ def export_video(engine, video_path, out_path, seconds=None, progress=None):
                 engine._clear_canvas()
             engine._update_media()           # upload this frame -> ctx.media
             engine._update_video()           # flow + blobs from this frame
+            engine._update_subject()         # person mask for 'effect behind subject'
             if effect:
                 effect.render(ctx)
             engine.postfx.apply(ctx.p, ctx.time)
             engine._render_and_blend_layers(feats, feats)   # the layer stack
             engine._apply_feedback()
             engine._composite_media()        # honors media_blend if the user set it
+            engine._composite_subject()      # subject in front of the effect/layers
             if engine._fx_active:
                 engine._render_secondary(feats, feats)
             engine._composite_shapes()

@@ -34,6 +34,19 @@ def media_params():
                help="Mix strength (and the Warp distortion amount)."),
         Slider("media_brightness", 0.0, 2.0, default=1.0, label="Media brightness",
                help="Brighten/darken the media."),
+        Choice("subject_front", ["Off", "Person", "Motion"], default="Off",
+               label="Effect behind subject",
+               help="Keep the SUBJECT in FRONT while the effect plays BEHIND "
+                    "them (the TouchDesigner look). Person = body segmentation "
+                    "(clean edges, best for people, any motion). Motion = cuts "
+                    "out whatever MOVES (no model, ultra-light & smooth, great "
+                    "for a static camera; a still subject fades). No generative "
+                    "AI either way."),
+        Slider("subject_strength", 0.0, 1.0, default=1.0, label="Subject strength",
+               help="How solidly the subject sits in front of the effect."),
+        Slider("subject_feather", 0.0, 1.0, default=0.4, label="Subject edge",
+               help="Soften (towards 1) or sharpen (towards 0) the cut-out edge "
+                    "around the subject."),
     ]
 
 # blend-mode name -> int the compositor kernel understands
@@ -61,6 +74,18 @@ class MediaSource:
         self._n_blobs = 0
         self._blob_prev = []            # last frame's centroids (for velocity)
         self._cv_res = (192, 108)       # analyze cheap, upscale flow to target
+        # --- subject cutout (effect-behind-the-subject): a foreground mask,
+        # computed in the grab thread when an effect/composite wants it. Two
+        # modes: "person" (MediaPipe body segmentation) or "motion" (background
+        # subtraction — cuts out what moves). Both are temporally smoothed. ---
+        self._mask_mode = "off"         # "off" | "person" | "motion"
+        self._want_mask = False
+        self._mask = None               # (H, W) float32 0..1 at target size
+        self._mask_ema = None           # smoothed mask (kills frame-to-frame flicker)
+        self._seg = None                # lazy MediaPipe ImageSegmenter
+        self._seg_fail = False
+        self.seg_status = ""
+        self._bgsub = None              # lazy OpenCV background subtractor (motion)
 
     # ---- control --------------------------------------------------------
     def set_target(self, w, h):
@@ -153,12 +178,117 @@ class MediaSource:
             self._blobs = blobs
             self._n_blobs = n
 
+    # ---- subject cutout (effect behind the subject) ---------------------
+    def set_mask(self, mode):
+        """Pick the cutout mode: "off" | "person" | "motion". Anything else is
+        treated as off, so plain playback pays nothing."""
+        mode = (mode or "off").lower()
+        if mode not in ("person", "motion"):
+            mode = "off"
+        if mode != self._mask_mode:           # switching modes -> drop history
+            self._bgsub = None
+            self._mask_ema = None
+        self._mask_mode = mode
+        self._want_mask = mode != "off"
+        if not self._want_mask:
+            with self._lock:
+                self._mask = None
+
+    def mask(self):
+        with self._lock:
+            return self._mask
+
+    def _get_segmenter(self):
+        """Lazily build MediaPipe's selfie ImageSegmenter. A discriminative
+        sensor (like optical flow) — it labels pixels, it doesn't generate art.
+        If MediaPipe / the model isn't available, the feature just stays off."""
+        if self._seg is not None:
+            return self._seg
+        if self._seg_fail:
+            return None
+        try:
+            import os
+            import mediapipe as mp
+            from mediapipe.tasks import python as mpp
+            from mediapipe.tasks.python import vision
+            model = os.path.join(os.path.dirname(__file__),
+                                 "models", "selfie_segmenter.tflite")
+            opts = vision.ImageSegmenterOptions(
+                base_options=mpp.BaseOptions(model_asset_path=model),
+                running_mode=vision.RunningMode.IMAGE,
+                output_category_mask=False,
+                output_confidence_masks=True)
+            self._seg = vision.ImageSegmenter.create_from_options(opts)
+            self.seg_status = "subject mask: on"
+        except Exception as e:
+            self._seg_fail = True
+            self.seg_status = f"subject mask off ({type(e).__name__})"
+            return None
+        return self._seg
+
+    def _person_mask(self, bgr):
+        """MediaPipe body segmentation -> soft mask (h, w) float32 0..1, or None
+        if the model isn't available."""
+        seg = self._get_segmenter()
+        if seg is None:
+            return None
+        import cv2
+        import mediapipe as mp
+        w, h = self._target
+        small = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
+        rgb = np.ascontiguousarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB))
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        res = seg.segment(mp_img)
+        m = res.confidence_masks[0].numpy_view()      # (h, w) float32 0..1
+        return cv2.GaussianBlur(m, (0, 0), 1.5)       # soften the cut-out edge
+
+    def _motion_mask(self, bgr):
+        """Background-subtraction cutout -> soft mask of whatever MOVES. Pure
+        OpenCV, no model — ultra-light and temporally smooth. Best with a static
+        camera; a subject that stops moving slowly fades back in."""
+        import cv2
+        w, h = self._target
+        small = cv2.resize(bgr, (w, h), interpolation=cv2.INTER_AREA)
+        if self._bgsub is None:
+            self._bgsub = cv2.createBackgroundSubtractorMOG2(
+                history=160, varThreshold=24, detectShadows=False)
+        fg = self._bgsub.apply(small)                 # 0/255 foreground
+        k3 = np.ones((3, 3), np.uint8)
+        k11 = np.ones((11, 11), np.uint8)
+        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, k3)            # drop speckle
+        fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, k11, iterations=2)  # fill body
+        fg = cv2.dilate(fg, np.ones((5, 5), np.uint8), iterations=1)
+        m = fg.astype(np.float32) / 255.0
+        return cv2.GaussianBlur(m, (0, 0), 3.0)       # soft, blobby edge
+
+    def _compute_mask(self, bgr):
+        """Compute the active-mode foreground mask, smooth it across frames to
+        kill flicker, and store it at target size (H, W) float32 0..1."""
+        if self._mask_mode == "person":
+            m = self._person_mask(bgr)
+        elif self._mask_mode == "motion":
+            m = self._motion_mask(bgr)
+        else:
+            return
+        if m is None:
+            return
+        # temporal EMA: blend with the last mask so edges don't shimmer/flicker.
+        prev = self._mask_ema
+        if prev is not None and prev.shape == m.shape:
+            m = prev * 0.55 + m * 0.45
+        self._mask_ema = m
+        with self._lock:
+            self._mask = m.astype(np.float32)
+
     def set_mode(self, mode, path=None, cam_index=0):
         self.stop()
         self._mode = mode
         self._path = path
+        self._bgsub = None              # new clip -> relearn the background
+        self._mask_ema = None
         with self._lock:
             self._frame = None
+            self._mask = None
         if mode == "off":
             self.status = "off"
             return
@@ -230,6 +360,11 @@ class MediaSource:
                         self._compute_analysis(bgr)
                     except Exception:
                         pass            # never let CV crash the capture loop
+                if self._want_mask:
+                    try:
+                        self._compute_mask(bgr)
+                    except Exception:
+                        pass            # segmentation is best-effort
                 if delay:
                     time.sleep(delay)
             cap.release()

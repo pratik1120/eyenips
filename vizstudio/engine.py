@@ -87,11 +87,12 @@ class MediaCompositor:
     """Owns the media frame + camera-motion fields, computes motion, and (for
     the optional 'Background' mode) blends media with the canvas."""
 
-    def __init__(self, canvas, media, motion, prev):
+    def __init__(self, canvas, media, motion, prev, mask):
         self.canvas = canvas
         self.media = media
         self.motion = motion     # ti.field(f32): camera-motion magnitude 0..1
         self.prev = prev         # ti.field(f32): previous-frame luma
+        self.mask = mask         # ti.field(f32): subject (person) mask 0..1
         self.w, self.h = canvas.shape[0], canvas.shape[1]
 
     @ti.func
@@ -145,6 +146,17 @@ class MediaCompositor:
                 v = j / self.h + (Ec[1] - 0.5) * a * 0.4
                 out = self._smp(u, v) * br
             self.canvas[i, j] = out
+
+    @ti.kernel
+    def overlay_subject(self, opacity: ti.f32, feather: ti.f32):
+        """Paste the masked SUBJECT (the clean media frame) in FRONT of whatever
+        is on the canvas, so the effect/layers play BEHIND the person. The mask
+        is a soft alpha; `feather` controls edge hardness (0 = crisp, 1 = soft)."""
+        k = 1.0 / (feather * 0.9 + 0.05)        # 0 -> hard edge, 1 -> soft edge
+        for i, j in self.canvas:
+            a = (self.mask[i, j] - 0.5) * k + 0.5
+            a = ti.min(ti.max(a, 0.0), 1.0) * opacity
+            self.canvas[i, j] = self.canvas[i, j] * (1.0 - a) + self.media[i, j] * a
 
 
 class Pointer:
@@ -202,6 +214,7 @@ class Engine:
         self.media_field = ti.Vector.field(3, ti.f32, shape=(width, height))
         self.motion_field = ti.field(ti.f32, shape=(width, height))
         self._prev_luma = ti.field(ti.f32, shape=(width, height))
+        self.mask_field = ti.field(ti.f32, shape=(width, height))   # subject mask
         self.postfx = PostFX(width, height, self.canvas)
         # GPU "present" path: pack the canvas to a uint8 image the UI can blit
         # directly. If it can't be built on this backend we fall back to the old
@@ -211,7 +224,8 @@ class Engine:
         except Exception:
             self.presenter = None
         self.media_fx = MediaCompositor(self.canvas, self.media_field,
-                                        self.motion_field, self._prev_luma)
+                                        self.motion_field, self._prev_luma,
+                                        self.mask_field)
         # frame feedback (infinite tunnels / spirals / echoes) — a post-pass
         # that recursively blends the previous composited frame back in.
         self.feedback = Feedback(width, height, self.canvas)
@@ -827,6 +841,7 @@ class Engine:
             if not self.paused:
                 self._update_media()   # refresh media+motion so effects can sample
                 self._update_video()   # optical flow + blobs for video effects
+                self._update_subject() # person mask for 'effect behind subject'
 
                 # trails: fade old frame instead of full clear
                 if self.ctx.p.get("trails"):
@@ -846,6 +861,7 @@ class Engine:
                 self._render_and_blend_layers(feats, signals)  # stack over main fx
                 self._apply_feedback()                          # tunnels / spirals / echoes
                 self._composite_media()
+                self._composite_subject()  # subject in front of the effect/layers
                 if self._fx_active:        # shapes showing other effects -> draw them
                     self._render_secondary(feats, signals)
                 self._composite_shapes()   # shapes interact with the final image
@@ -926,6 +942,35 @@ class Engine:
         self.blob_field.from_numpy(np.ascontiguousarray(conv.astype(np.float32)))
         self.ctx.n_blobs = int(n)
         self.ctx.has_video = True
+
+    def _update_subject(self):
+        """Turn person segmentation on/off and upload the subject mask, so the
+        SUBJECT of the video/camera can be composited in FRONT of the effect
+        ('Effect behind subject'). Only active when the user enables it AND media
+        is producing frames — otherwise segmentation costs nothing."""
+        self.ctx.has_subject = False
+        if self.media is None:
+            return
+        mode = self.ctx.p.get("subject_front", "Off")
+        wants = self.ctx.has_media and mode in ("Person", "Motion")
+        if hasattr(self.media, "set_mask"):
+            self.media.set_mask(mode.lower() if wants else "off")
+        if not wants:
+            return
+        m = self.media.mask() if hasattr(self.media, "mask") else None
+        if m is not None and m.shape == (self.h, self.w):
+            # (H,W) image mask -> field[x,y] in the canvas' (x right, y up) frame
+            self.mask_field.from_numpy(
+                np.ascontiguousarray(np.flipud(m).T.astype(np.float32)))
+            self.ctx.has_subject = True
+
+    def _composite_subject(self):
+        """Paste the masked subject over the composited frame (effect behind)."""
+        if not getattr(self.ctx, "has_subject", False):
+            return
+        self.media_fx.overlay_subject(
+            float(self.ctx.p.get("subject_strength", 1.0)),
+            float(self.ctx.p.get("subject_feather", 0.4)))
 
     def _composite_shapes(self):
         """Draw the shape elements as a layer that interacts with the effect.

@@ -52,6 +52,9 @@ class Context:
         self.n_blobs = 0            # how many entries in `blobs` are live this frame
         self.max_blobs = 0          # capacity of the blobs field
         self.has_video = False      # is video analysis available this frame?
+        self.has_subject = False    # is a person/subject mask ready this frame?
+                                    #   (engine composites the SUBJECT in front
+                                    #   of the effect when "Effect behind subject")
         # live pointer: lets an effect be INTERACTIVE (the mouse over the preview).
         # None in headless/export; otherwise a Pointer with x/y in 0..1 (y up to
         # match the canvas), dx/dy per-frame velocity, down (button), active (over).

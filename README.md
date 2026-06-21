@@ -333,6 +333,22 @@ and *any* effect (Liquid Fractal, Plasma, …) distorts your media — no Create
 Effect needed. **Behind / Tint / Screen** give the plain-backdrop mixes. These
 are normal knobs, so they're **audio-drivable** (e.g. Media opacity ← Beat).
 
+**🫥 Effect *behind* the subject.** Set **Effect behind subject** and the subject
+of your video/camera stays in **front** while the effect (and any layers) play
+**behind** them — the TouchDesigner depth-composite look, in one pick. Two modes:
+
+- **Person** — body segmentation: clean edges, works even when the subject is
+  still. Needs `mediapipe` (ships the model); without it this mode does nothing.
+- **Motion** — cuts out whatever **moves** (background subtraction): no model,
+  ultra-light, rock-steady framerate — best with a static camera; a subject that
+  stops moving slowly fades back in. Pure OpenCV.
+
+Both are **temporally smoothed** (an across-frames blend) so the edge doesn't
+shimmer. **Subject strength** sets how solidly they sit on top; **Subject edge**
+softens or sharpens the cut-out. Either way it's a *sensor* — it labels which
+pixels are the subject — so there's **no generative AI**, same family as the
+optical-flow and blob tracking. Bakes into both the audio and video exports.
+
 Needs `opencv-python`; without it the Media section is hidden and everything
 else works.
 
