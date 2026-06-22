@@ -25,6 +25,7 @@ from .effect import Effect
 from .registry import discover
 from .exprutil import cheat_sheet, translate, exec_with_source
 from . import labkit
+from . import paths
 from .exprfx import ExpressionEffectBase
 from .builder_templates import CODE_TEMPLATE, expression_file, EXPR_EFFECT_NAME
 from . import patterns
@@ -97,10 +98,18 @@ class ControlPanel:
         self._out_label = None
         self._out_photo = None
         self._tip_win = None
-        # where sessions + presets live (next to the effects/ folder)
-        data_dir = os.path.dirname(effects_dir) if effects_dir else os.getcwd()
-        self._session_path = os.path.join(data_dir, ".vizsession.viz")
-        self._presets_dir = os.path.join(data_dir, "presets")
+        # Writable user data lives in ~/.eyenips (NOT the install dir, which is
+        # read-only in a Program Files install) so sessions/presets persist and
+        # survive updates. Starter presets ship bundled and are read read-only.
+        udir = paths.user_data_dir()
+        try:
+            os.makedirs(udir, exist_ok=True)
+        except Exception:
+            udir = os.getcwd()                      # last-ditch: stay runnable
+        self._session_path = os.path.join(udir, "session.viz")
+        self._presets_dir = os.path.join(udir, "presets")     # where SAVES go
+        self._builtin_presets_dir = paths.find("presets")     # bundled starters
+        self._welcome_flag = os.path.join(udir, ".welcomed")  # first-run greeting
 
     def build(self):
         """Create the ONE app window (preview + docked controls). Does NOT
@@ -204,6 +213,10 @@ class ControlPanel:
         self.apply_theme(self.theme_var.get())
         self._init_history()       # baseline for undo/redo = the restored state
 
+        # First launch (no "seen" marker yet): greet the user with a 3-step start.
+        if not os.path.exists(self._welcome_flag):
+            self.root.after(250, lambda: self._show_welcome(first_run=True))
+
     # ---- dockable panels -----------------------------------------------
     def _init_panels(self):
         # builder(parent) builds that panel's content into `parent`.
@@ -292,6 +305,90 @@ class ControlPanel:
         self._menus.append(out)
         self._rebuild_output_menu()
 
+        help_btn = tk.Menubutton(self.toolbar, text="Help ▾")
+        hm = tk.Menu(help_btn, tearoff=0)
+        help_btn.config(menu=hm)
+        help_btn.pack(side="left", padx=2)
+        hm.add_command(label="Quick start…", command=lambda: self._show_welcome())
+        hm.add_command(label="About Eyenips…", command=self._show_about)
+        self._menus.append(hm)
+
+    _WELCOME_STEPS = [
+        ("🔊", "It's already listening",
+         "Eyenips reacts to whatever's playing on your PC (the “System” source). "
+         "Just play music — or load a song file in the Media panel. The visuals "
+         "move with the sound."),
+        ("🎨", "Pick an effect, then roll the dice",
+         "Choose one from the Effect dropdown. Try “Effect Lab” and hit "
+         "🎲 Randomize — every click is a brand-new effect from millions. Tweak "
+         "the knobs in Parameters."),
+        ("🎬", "Turn a video into an effect",
+         "Load a video (Media panel) and pick “Video Lab” or “Effect Lab”. The "
+         "effect becomes content-aware. Toggle “Effect behind subject” to put the "
+         "effect behind a person — then 🎬 Export it."),
+        ("✎", "Make it yours",
+         "“✎ Edit equations” opens the actual math behind the labs — edit it, add "
+         "your own, or Reset. It's all pure math; no AI. Have fun!"),
+    ]
+
+    def _show_welcome(self, first_run=False):
+        win = tk.Toplevel(self.root)
+        win.title("Welcome to Eyenips")
+        win.resizable(False, False)
+        win.transient(self.root)
+        tk.Label(win, text="Welcome to Eyenips 🎶", font=("", 17, "bold")).pack(
+            padx=28, pady=(18, 2))
+        tk.Label(win, text="A no-code music visualizer. Three quick steps:",
+                 fg="#888").pack(pady=(0, 10))
+        body = tk.Frame(win)
+        body.pack(fill="x", padx=26)
+        for icon, title, text in self._WELCOME_STEPS:
+            row = tk.Frame(body)
+            row.pack(fill="x", pady=6, anchor="w")
+            tk.Label(row, text=icon, font=("", 18)).pack(side="left", padx=(0, 12), anchor="n")
+            col = tk.Frame(row)
+            col.pack(side="left", fill="x", expand=True)
+            tk.Label(col, text=title, font=("", 11, "bold"), anchor="w").pack(anchor="w")
+            tk.Label(col, text=text, fg="#555", justify="left", wraplength=440,
+                     anchor="w").pack(anchor="w")
+
+        def _dismiss():
+            try:
+                with open(self._welcome_flag, "w", encoding="utf-8") as f:
+                    f.write("seen")          # don't auto-show next launch
+            except Exception:
+                pass
+            win.destroy()
+
+        bar = tk.Frame(win)
+        bar.pack(fill="x", padx=26, pady=16)
+        tk.Label(bar, text="(Reopen any time from Help → Quick start)",
+                 fg="#999").pack(side="left")
+        tk.Button(bar, text="Let's go!", command=_dismiss).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", _dismiss)
+
+    def _show_about(self):
+        import vizstudio
+        backend = "?"
+        try:
+            import taichi as ti
+            backend = str(ti.lang.impl.current_cfg().arch).split(".")[-1]
+        except Exception:
+            pass
+        win = tk.Toplevel(self.root)
+        win.title("About Eyenips")
+        win.resizable(False, False)
+        tk.Label(win, text="Eyenips", font=("", 16, "bold")).pack(padx=24, pady=(16, 2))
+        tk.Label(win, text=f"version {vizstudio.__version__}").pack()
+        tk.Label(win, text=f"render backend: {backend}", fg="#888").pack(pady=(0, 8))
+        tk.Label(win, justify="center", fg="#666", wraplength=320,
+                 text=("A no-code music-visualization studio.\n"
+                       "Pure math + audio/video analysis — no generative AI.")).pack(
+            padx=24, pady=(0, 6))
+        tk.Label(win, fg="#888", wraplength=320, justify="center",
+                 text=f"Your data: {paths.user_data_dir()}").pack(padx=24)
+        tk.Button(win, text="Close", command=win.destroy).pack(pady=14)
+
     def _rebuild_project_menu(self):
         m = getattr(self, "_project_menu", None)
         if m is None:
@@ -302,14 +399,14 @@ class ControlPanel:
         m.add_command(label="Save project as…", command=lambda: self._save_project(True))
         m.add_separator()
         m.add_command(label="Save as preset…", command=self._save_preset)
-        presets = project.list_presets(self._presets_dir)
+        presets = sorted(set(project.list_presets(self._presets_dir))
+                         | set(project.list_presets(self._builtin_presets_dir)))
         if presets:
             sub = tk.Menu(m, tearoff=0)
             for name in presets:
                 sub.add_command(
                     label=name,
-                    command=lambda n=name: self._open_project(
-                        os.path.join(self._presets_dir, n + project.EXT)))
+                    command=lambda n=name: self._open_project(self._preset_path(n)))
             m.add_cascade(label="Load preset", menu=sub)
             self._menus.append(sub)
         if getattr(self, "_theme", None):
@@ -1639,7 +1736,20 @@ class ControlPanel:
         for c in self.effect_classes:
             if c.name == name:
                 self.engine.request_effect(c)
+                self._effect_empty_hint(c)
                 break
+
+    def _effect_empty_hint(self, cls):
+        """Nudge the user when a video effect has no footage to act on — the #1
+        'I picked it and nothing happens' confusion. Otherwise just name it."""
+        if getattr(cls, "uses_video", False):
+            mode = getattr(self.engine.media, "_mode", "off") if self.engine.media else "off"
+            if mode not in ("video", "camera", "image"):
+                self._set_status("🎬 This is a video effect — load a video or camera "
+                                 "in the Media panel to see it act on footage "
+                                 "(it still works as a generative visual without one).")
+                return
+        self._set_status(f"Effect: {cls.name}")
 
     def _reset(self):
         if self.engine.effect:
@@ -1809,6 +1919,14 @@ class ControlPanel:
         except Exception as e:
             self._set_status(f"Open failed: {e}", error=True)
 
+    def _preset_path(self, name):
+        """Resolve a preset name to a file: a user-saved copy wins over the
+        bundled starter of the same name."""
+        user = os.path.join(self._presets_dir, name + project.EXT)
+        if os.path.exists(user):
+            return user
+        return os.path.join(self._builtin_presets_dir, name + project.EXT)
+
     def _save_preset(self):
         os.makedirs(self._presets_dir, exist_ok=True)
         path = filedialog.asksaveasfilename(
@@ -1836,7 +1954,7 @@ class ControlPanel:
                 self._apply_state(project.load(self._session_path))
                 return
             except Exception as e:
-                print(f"[session] could not restore: {e}")
+                paths.safe_print(f"[session] could not restore: {e}")
         # fresh launch: start the default source so "System" works on day one
         # (loopback is silent until something plays — no harm, instant payoff)
         if self.engine.audio and self.audio_mode.get() != "none":
