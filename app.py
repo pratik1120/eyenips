@@ -6,9 +6,6 @@ Initializes the GPU, discovers every effect in effects/, opens the control
 panel (its own thread) and the render window (main thread).
 """
 
-import os
-import sys
-
 import taichi as ti
 
 from vizstudio.engine import Engine
@@ -16,24 +13,38 @@ from vizstudio.audio import AudioEngine
 from vizstudio.media import MediaSource
 from vizstudio.registry import discover
 from vizstudio.ui import ControlPanel
+from vizstudio import paths
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-EFFECTS_DIR = os.path.join(HERE, "effects")
+# Effects live as loose, updatable files next to the exe (or in the project in
+# dev) — resolved frozen-safely so the packaged app finds them too.
+EFFECTS_DIR = paths.effects_dir()
 
 # The canvas is now drawn *inside* the app window, so keep it a size that
 # converts to an image smoothly each frame.
 WIDTH, HEIGHT = 1024, 640
 
 
+def _init_taichi():
+    """Bring up the GPU backend, but never let a machine without a usable GPU
+    (no CUDA/Vulkan, old drivers) crash the app — fall back to CPU."""
+    try:
+        ti.init(arch=ti.gpu)
+        return "gpu"
+    except Exception as e:
+        paths.safe_print(f"[taichi] GPU unavailable ({e}); falling back to CPU.")
+        ti.init(arch=ti.cpu)
+        return "cpu"
+
+
 def main(prefer=None):
     """prefer: optional effect name to start on (else the first discovered)."""
-    ti.init(arch=ti.gpu)
+    backend = _init_taichi()
 
     effect_classes, errors = discover(EFFECTS_DIR)
     for fn, msg in errors:
-        print(f"[skip] {fn} failed to load:\n{msg}", file=sys.stderr)
+        paths.safe_print(f"[skip] {fn} failed to load:\n{msg}")
     if not effect_classes:
-        print("No effects found in effects/. Add an Effect subclass there.")
+        paths.safe_print("No effects found in effects/. Add an Effect subclass there.")
         return
 
     # pick the start effect: the requested one, else the first *visual* effect
@@ -53,9 +64,9 @@ def main(prefer=None):
     # Falls back to silent if loopback capture isn't available.
     audio.set_mode("system")
 
-    print("=== Eyenips ===")
-    print(f"Effects: {', '.join(c.name for c in effect_classes)}")
-    print("Everything lives in one window: preview on the left, controls on the right.")
+    paths.safe_print(f"=== Eyenips === (render backend: {backend})")
+    paths.safe_print(f"Effects: {', '.join(c.name for c in effect_classes)}")
+    paths.safe_print("Everything lives in one window: preview left, controls right.")
 
     # Single-threaded: Tkinter MUST run on the main thread. We build the one
     # window here and let the render loop draw frames into it + pump the UI.

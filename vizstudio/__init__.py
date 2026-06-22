@@ -8,6 +8,8 @@ Drop a new effect file in the `effects/` folder, subclass `Effect`, declare
 your `params`, and it shows up in the app automatically.
 """
 
+__version__ = "0.1.0"
+
 from .params import Slider, IntSlider, Toggle, Choice, ColorPalette, Param
 from .effect import Effect, Context
 

@@ -211,8 +211,15 @@ class MediaSource:
             import mediapipe as mp
             from mediapipe.tasks import python as mpp
             from mediapipe.tasks.python import vision
-            model = os.path.join(os.path.dirname(__file__),
-                                 "models", "selfie_segmenter.tflite")
+            from . import paths
+            # frozen-safe: works in dev AND when bundled (the model may land under
+            # vizstudio/models or models/ depending on the build's data spec)
+            model = paths.find(
+                os.path.join("vizstudio", "models", "selfie_segmenter.tflite"),
+                os.path.join("models", "selfie_segmenter.tflite"))
+            if not os.path.exists(model):     # dev fallback: next to this file
+                model = os.path.join(os.path.dirname(__file__),
+                                     "models", "selfie_segmenter.tflite")
             opts = vision.ImageSegmenterOptions(
                 base_options=mpp.BaseOptions(model_asset_path=model),
                 running_mode=vision.RunningMode.IMAGE,

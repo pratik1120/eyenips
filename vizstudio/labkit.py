@@ -113,7 +113,8 @@ VIDEO_GROUPS = {
 # persistence
 # --------------------------------------------------------------------------
 def _kit_dir():
-    return os.path.join(os.path.expanduser("~"), ".eyenips")
+    from . import paths
+    return paths.user_data_dir()
 
 
 def _kit_path():
