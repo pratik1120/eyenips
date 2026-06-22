@@ -24,6 +24,7 @@ from .params import Slider, IntSlider, Toggle, Choice, ColorPalette, AUDIO_SOURC
 from .effect import Effect
 from .registry import discover
 from .exprutil import cheat_sheet, translate, exec_with_source
+from . import labkit
 from .exprfx import ExpressionEffectBase
 from .builder_templates import CODE_TEMPLATE, expression_file, EXPR_EFFECT_NAME
 from . import patterns
@@ -1215,6 +1216,7 @@ class ControlPanel:
         btns = tk.Frame(box); btns.pack(fill="x", pady=(4, 0))
         tk.Button(btns, text="Reset effect", command=self._reset).pack(side="left")
         tk.Button(btns, text="🎲 Randomize", command=self._randomize_recipe).pack(side="left", padx=6)
+        tk.Button(btns, text="✎ Edit equations…", command=self._open_lab_editor).pack(side="left", padx=6)
         tk.Button(btns, text="✨ Shapes…", command=self._open_shapes).pack(side="left", padx=6)
         tk.Button(btns, text="🧱 Layers…", command=self._open_layers).pack(side="left", padx=6)
         tk.Button(btns, text="✎ Create Effect…", command=self._goto_create).pack(side="left", padx=6)
@@ -1234,6 +1236,251 @@ class ControlPanel:
         self._build_params()                      # reflect the new value on the knob
         self.apply_theme(self.theme_var.get())    # fresh widgets need the theme re-applied
         self._set_status(f"🎲 Recipe {val}")
+
+    # ---- Lab Kit editor: edit the generative equations & recipe ranges ---
+    _EL_PAIR = [("f1", "freq 1"), ("f2", "freq 2"), ("f3", "freq 3"),
+                ("fw1", "warp freq 1"), ("fw2", "warp freq 2"),
+                ("colscale", "colour scale"), ("coloff", "colour offset"),
+                ("bands", "colour bands"), ("contrast", "line contrast"),
+                ("levels", "poster levels"), ("spd", "speed")]
+    _EL_LIST = [("mix_weights", "blend modes (0=single,1=avg,2=mult,3=max,4=mask)"),
+                ("sym_weights", "symmetry (0=none,1=mirror,2=kaleido,3=4-way)"),
+                ("nfold_choices", "kaleidoscope folds"),
+                ("style_weights", "render style (0=smooth,1=line,2=flats)"),
+                ("colmode_weights", "colour mode (0=value,1=angle,2=banded,3=radius)"),
+                ("warp_choices", "domain-warp amounts")]
+    _VL_PAIR = [("dominant", "dominant ops (count)"), ("accent", "accent ops (count)"),
+                ("dominant_weight", "dominant strength"), ("accent_weight", "accent strength"),
+                ("fold", "kaleido folds"), ("tiles", "mosaic tiles"), ("woff", "split offset"),
+                ("levels", "poster levels"), ("colscale", "colour scale"),
+                ("coloff", "colour offset"), ("fw1", "wave freq 1"), ("fw2", "wave freq 2"),
+                ("edgeg", "edge gain"), ("ovsize", "overlay size"), ("disp", "displacement"),
+                ("spd", "speed")]
+
+    def _open_lab_editor(self):
+        """Open the equation/recipe editor for the current generative lab."""
+        eff = self.engine.effect
+        kind = getattr(eff, "editable_kit", None)
+        if not kind:
+            self._set_status("Only the generative labs (Effect Lab / Video Lab) "
+                             "have editable equations — pick one first.")
+            return
+        if getattr(self, "_lab_win", None) is not None:
+            try:
+                self._lab_win.destroy()
+            except Exception:
+                pass
+        win = tk.Toplevel(self.root)
+        self._lab_win = win
+        self._lab_kind = kind
+        win.title(f"Edit equations — {eff.name}")
+        win.geometry("760x680")
+        self._lab_body = tk.Frame(win)
+        self._lab_body.pack(fill="both", expand=True)
+
+        bar = tk.Frame(win, padx=8, pady=6)
+        bar.pack(fill="x", side="bottom")
+        self._lab_status = tk.Label(bar, text="", fg="#888", anchor="w",
+                                    wraplength=440, justify="left")
+        self._lab_status.pack(side="left", fill="x", expand=True)
+        tk.Button(bar, text="Reset to defaults", command=self._lab_reset).pack(side="right")
+        tk.Button(bar, text="✓ Apply", command=self._lab_apply).pack(side="right", padx=6)
+
+        self._lab_render(eff.current_kit())
+
+    def _lab_render(self, kit):
+        """(Re)build the editor widgets from a kit dict (used on open + Reset)."""
+        for c in self._lab_body.winfo_children():
+            c.destroy()
+        # scrollable inner frame
+        canvas = tk.Canvas(self._lab_body, highlightthickness=0)
+        sb = tk.Scrollbar(self._lab_body, orient="vertical", command=canvas.yview)
+        inner = tk.Frame(canvas)
+        inner.bind("<Configure>",
+                   lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.configure(yscrollcommand=sb.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb.pack(side="right", fill="y")
+        self._wheel_scroll(canvas)
+        if self._lab_kind == "effect_lab":
+            self._build_effectlab_editor(inner, kit)
+        else:
+            self._build_videolab_editor(inner, kit)
+
+    def _lab_pair_row(self, parent, label, pair):
+        """A 'lo .. hi' range editor row. Returns (lo_var, hi_var)."""
+        row = tk.Frame(parent)
+        row.pack(fill="x", pady=1)
+        tk.Label(row, text=label, width=24, anchor="w").pack(side="left")
+        lo = tk.StringVar(value=str(pair[0]))
+        hi = tk.StringVar(value=str(pair[1]))
+        tk.Entry(row, textvariable=lo, width=8).pack(side="left")
+        tk.Label(row, text="…").pack(side="left", padx=2)
+        tk.Entry(row, textvariable=hi, width=8).pack(side="left")
+        return lo, hi
+
+    def _build_effectlab_editor(self, inner, kit):
+        el = kit["effect_lab"]
+        tk.Label(inner, text="ARCHETYPE EQUATIONS", font=("", 10, "bold")).pack(
+            anchor="w", padx=8, pady=(8, 0))
+        tk.Label(inner, justify="left", fg="#666", wraplength=700,
+                 text=("Each is a formula in u, v (position −1..1), t (time), f1/f2/f3 "
+                       "(recipe frequencies) and ph (phase). Functions: sin cos tan sqrt "
+                       "abs floor ceil exp log min max atan2 round, plus building blocks "
+                       "vor(x,y,t), julia(u,v,f1,f2,ph,t), fbm(x,y), vnoise(x,y). Range "
+                       "≈ −1..1.")).pack(anchor="w", padx=8)
+        self._el_rows = []
+        self._el_host = tk.Frame(inner)
+        self._el_host.pack(fill="x", padx=8, pady=2)
+        for a in el["archetypes"]:
+            self._el_add_row(a.get("name", ""), a.get("formula", ""))
+        tk.Button(inner, text="+ Add archetype",
+                  command=lambda: self._el_add_row("new", "sin(u*f1+t)*cos(v*f2-t)")).pack(
+            anchor="w", padx=8, pady=(2, 8))
+
+        tk.Label(inner, text="RECIPE RANGES", font=("", 10, "bold")).pack(
+            anchor="w", padx=8, pady=(6, 0))
+        tk.Label(inner, fg="#666", text="How a Recipe number is rolled into an effect.").pack(
+            anchor="w", padx=8)
+        self._el_pair_vars = {}
+        pf = tk.Frame(inner)
+        pf.pack(fill="x", padx=8, pady=2)
+        for key, lab in self._EL_PAIR:
+            self._el_pair_vars[key] = self._lab_pair_row(pf, lab, el["recipe"][key])
+        self._el_list_vars = {}
+        lf = tk.Frame(inner)
+        lf.pack(fill="x", padx=8, pady=2)
+        for key, lab in self._EL_LIST:
+            row = tk.Frame(lf)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=lab, width=40, anchor="w").pack(side="left")
+            var = tk.StringVar(value=", ".join(str(x) for x in el["recipe"][key]))
+            tk.Entry(row, textvariable=var, width=26).pack(side="left", fill="x", expand=True)
+            self._el_list_vars[key] = var
+
+    def _el_add_row(self, name, formula):
+        row = tk.Frame(self._el_host)
+        row.pack(fill="x", pady=1)
+        nv = tk.StringVar(value=name)
+        fv = tk.StringVar(value=formula)
+        tk.Entry(row, textvariable=nv, width=12).pack(side="left")
+        tk.Entry(row, textvariable=fv, width=58).pack(side="left", fill="x", expand=True, padx=2)
+        rec = {"name": nv, "formula": fv, "frame": row}
+        tk.Button(row, text="✕", width=2,
+                  command=lambda: self._el_del_row(rec)).pack(side="left")
+        self._el_rows.append(rec)
+
+    def _el_del_row(self, rec):
+        if len(self._el_rows) <= 1:
+            self._lab_status.config(text="Keep at least one archetype.", fg="#a60")
+            return
+        rec["frame"].destroy()
+        self._el_rows.remove(rec)
+
+    def _build_videolab_editor(self, inner, kit):
+        vl = kit["video_lab"]
+        tk.Label(inner, text="OPERATORS IN THE RANDOM POOL", font=("", 10, "bold")).pack(
+            anchor="w", padx=8, pady=(8, 0))
+        tk.Label(inner, fg="#666", wraplength=700, justify="left",
+                 text=("Tick the operators a Recipe may draw from. The operator MATH is "
+                       "built in; uncheck any you don't want appearing.")).pack(
+            anchor="w", padx=8)
+        self._vl_op_vars = {}
+        for grp, title in (("warp", "Warp the footage"), ("color", "Restyle colour"),
+                           ("over", "Motion overlays")):
+            f = tk.LabelFrame(inner, text=title, padx=6, pady=2)
+            f.pack(fill="x", padx=8, pady=3)
+            for o in labkit.VIDEO_GROUPS[grp]:
+                var = tk.BooleanVar(value=bool(vl["operators"].get(o, True)))
+                tk.Checkbutton(f, text=o, variable=var).pack(side="left")
+                self._vl_op_vars[o] = var
+
+        tk.Label(inner, text="RECIPE RANGES", font=("", 10, "bold")).pack(
+            anchor="w", padx=8, pady=(8, 0))
+        self._vl_pair_vars = {}
+        pf = tk.Frame(inner)
+        pf.pack(fill="x", padx=8, pady=2)
+        for key, lab in self._VL_PAIR:
+            self._vl_pair_vars[key] = self._lab_pair_row(pf, lab, vl["recipe"][key])
+
+    # ---- read / validate / apply ---------------------------------------
+    def _parse_num(self, s):
+        s = s.strip()
+        f = float(s)
+        return int(f) if f == int(f) and "." not in s and "e" not in s.lower() else f
+
+    def _collect_effectlab_kit(self):
+        kit = labkit.defaults()
+        archs = []
+        for rec in self._el_rows:
+            name = rec["name"].get().strip() or "arch"
+            formula = rec["formula"].get().strip()
+            if not formula:
+                continue
+            err = labkit.validate_formula(formula)
+            if err:
+                raise ValueError(f"'{name}': {err}")
+            archs.append({"name": name, "formula": formula})
+        if not archs:
+            raise ValueError("need at least one archetype with a formula")
+        kit["effect_lab"]["archetypes"] = archs
+        rc = kit["effect_lab"]["recipe"]
+        for key, (lo, hi) in self._el_pair_vars.items():
+            rc[key] = [self._parse_num(lo.get()), self._parse_num(hi.get())]
+        for key, var in self._el_list_vars.items():
+            nums = [self._parse_num(x) for x in var.get().split(",") if x.strip()]
+            if not nums:
+                raise ValueError(f"'{key}' needs at least one value")
+            rc[key] = nums
+        return kit
+
+    def _collect_videolab_kit(self):
+        kit = labkit.defaults()
+        for o, var in self._vl_op_vars.items():
+            kit["video_lab"]["operators"][o] = bool(var.get())
+        if not any(kit["video_lab"]["operators"].values()):
+            raise ValueError("enable at least one operator")
+        rc = kit["video_lab"]["recipe"]
+        for key, (lo, hi) in self._vl_pair_vars.items():
+            rc[key] = [self._parse_num(lo.get()), self._parse_num(hi.get())]
+        return kit
+
+    def _lab_apply(self):
+        eff = self.engine.effect
+        if getattr(eff, "editable_kit", None) != self._lab_kind:
+            self._lab_status.config(
+                text=f"Switch back to the {self._lab_kind.replace('_',' ')} effect to apply.",
+                fg="#a60")
+            return
+        try:
+            if self._lab_kind == "effect_lab":
+                kit = self._collect_effectlab_kit()
+            else:
+                kit = self._collect_videolab_kit()
+        except (ValueError, Exception) as e:
+            self._lab_status.config(text=f"✗ {e}", fg="#c00")
+            return
+        eff.set_kit(kit)
+        # surface a compile error from the next render (Effect Lab) if any
+        ok, msg = labkit.save(kit)
+        err = getattr(eff, "error", "")
+        if err:
+            self._lab_status.config(text=f"⚠ applied, but: {err}", fg="#a60")
+        elif ok:
+            self._lab_status.config(text="✓ Applied & saved.", fg="#080")
+        else:
+            self._lab_status.config(text=f"Applied (save failed: {msg})", fg="#a60")
+
+    def _lab_reset(self):
+        ok, msg = labkit.reset()
+        kit = labkit.defaults()
+        eff = self.engine.effect
+        if getattr(eff, "editable_kit", None) == self._lab_kind:
+            eff.set_kit(kit)
+        self._lab_render(kit)
+        self._lab_status.config(text="↺ Reset to defaults." if ok else f"Reset: {msg}",
+                                fg="#080" if ok else "#a60")
 
     def _build_export_section(self, parent):
         box = tk.Frame(parent, padx=8, pady=4)

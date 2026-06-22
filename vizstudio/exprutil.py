@@ -55,9 +55,14 @@ _LEGAL_CHARS = set("0123456789abcdefghijklmnopqrstuvwxyz"
 _IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
-def translate(expr, allowed_vars=None):
-    """Return Taichi source for `expr`. Raises ValueError on anything illegal."""
+def translate(expr, allowed_vars=None, extra_funcs=None):
+    """Return Taichi source for `expr`. Raises ValueError on anything illegal.
+
+    `extra_funcs` maps friendly helper names to their generated names (e.g.
+    {"vor": "_vor"}), so callers like the Lab Kit editor can expose extra
+    building-block functions on top of the standard math vocabulary."""
     allowed = set(allowed_vars or VARS)
+    funcs = FUNCS if not extra_funcs else {**FUNCS, **extra_funcs}
     expr = (expr or "").strip()
     if not expr:
         return "0.0"
@@ -68,8 +73,8 @@ def translate(expr, allowed_vars=None):
 
     def repl(m):
         name = m.group(0)
-        if name in FUNCS:
-            return FUNCS[name]
+        if name in funcs:
+            return funcs[name]
         if name in CONSTS:
             return CONSTS[name]
         if name in allowed:

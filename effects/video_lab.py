@@ -28,6 +28,7 @@ import random as _random
 import taichi as ti
 
 from vizstudio import Effect, Slider, IntSlider, ColorPalette
+from vizstudio import labkit
 
 TWO_PI = 6.28318
 
@@ -46,6 +47,7 @@ class VideoLab(Effect):
                    "truly random, not combinations. Load a video. No AI.")
     author = "Eyenips"
     uses_video = True
+    editable_kit = "video_lab"     # the Edit-equations editor edits its recipe
 
     params = [
         IntSlider("recipe", 0, 99999, default=7, audio=False,
@@ -72,34 +74,58 @@ class VideoLab(Effect):
         self.flow = ctx.flow
         self.blobs = ctx.blobs
         self._seed = None
+        self._kit = labkit.load()
         self._R = self._recipe(7)
 
+    def set_kit(self, kit):
+        """Called by the Edit-equations editor — swaps in edited operator pool /
+        recipe ranges and re-rolls the current recipe next frame."""
+        self._kit = kit
+        self._seed = None
+
+    def current_kit(self):
+        return self._kit
+
     def _recipe(self, seed):
-        """Each Recipe has a distinct CHARACTER: a few (2-4) dominant operators
-        plus a couple of subtle accents, the rest off. Continuous weights (so it's
-        never binary on/off) but sparse (so it's never a muddy kitchen-sink) — that
-        balance is what makes recipes feel genuinely random and distinct."""
+        """Each Recipe has a distinct CHARACTER: a few dominant operators plus a
+        couple of subtle accents, the rest off. Continuous weights (so it's never
+        binary on/off) but sparse (so it's never a muddy kitchen-sink) — that
+        balance is what makes recipes feel genuinely random and distinct. The
+        operator pool, sparsity and ranges are the editable Lab Kit."""
+        vk = self._kit["video_lab"]
+        rc = vk["recipe"]
+        ops_on = [o for o in _OPS if vk["operators"].get(o, True)] or list(_OPS)
+        over_on = [o for o in _OVER if o in ops_on]
         rng = _random.Random((int(seed) * 2654435761) & 0xFFFFFFFF)
         R = {o: 0.0 for o in _OPS}
-        for o in rng.sample(_OPS, rng.randint(2, 4)):           # dominant character
-            R[o] = rng.uniform(0.5, 1.0)
-        rest = [o for o in _OPS if R[o] == 0.0]
-        for o in rng.sample(rest, rng.randint(0, 2)):           # subtle accents
-            R[o] = rng.uniform(0.1, 0.35)
-        if rng.random() < 0.6 and not any(R[o] > 0.1 for o in _OVER):
-            R[rng.choice(_OVER)] = rng.uniform(0.5, 1.0)         # usually some motion overlay
-        R["fold"] = rng.uniform(3.0, 8.0)
-        R["tiles"] = rng.uniform(2.0, 9.0)
-        R["woff"] = rng.uniform(4.0, 18.0)
-        R["levels"] = float(rng.randint(2, 6))
-        R["colscale"] = rng.uniform(0.3, 1.5)
-        R["coloff"] = rng.uniform(0.0, 1.0)
-        R["fw1"] = rng.uniform(2.0, 6.0)
-        R["fw2"] = rng.uniform(2.0, 6.0)
-        R["edgeg"] = rng.uniform(3.0, 9.0)
-        R["ovsize"] = rng.uniform(0.5, 1.5)
-        R["disp"] = rng.uniform(0.12, 0.4)
-        R["spd"] = rng.choice([-1.0, 1.0]) * rng.uniform(0.4, 1.5)
+
+        def rint(key):
+            return rng.randint(int(rc[key][0]), int(rc[key][1]))
+
+        def runi(key):
+            return rng.uniform(rc[key][0], rc[key][1])
+
+        ndom = min(len(ops_on), rint("dominant"))               # dominant character
+        for o in rng.sample(ops_on, ndom):
+            R[o] = runi("dominant_weight")
+        rest = [o for o in ops_on if R[o] == 0.0]
+        nacc = min(len(rest), rint("accent"))                   # subtle accents
+        for o in rng.sample(rest, nacc):
+            R[o] = runi("accent_weight")
+        if over_on and rng.random() < 0.6 and not any(R[o] > 0.1 for o in _OVER):
+            R[rng.choice(over_on)] = runi("dominant_weight")    # usually some motion overlay
+        R["fold"] = runi("fold")
+        R["tiles"] = runi("tiles")
+        R["woff"] = runi("woff")
+        R["levels"] = float(rint("levels"))
+        R["colscale"] = runi("colscale")
+        R["coloff"] = runi("coloff")
+        R["fw1"] = runi("fw1")
+        R["fw2"] = runi("fw2")
+        R["edgeg"] = runi("edgeg")
+        R["ovsize"] = runi("ovsize")
+        R["disp"] = runi("disp")
+        R["spd"] = rng.choice([-1.0, 1.0]) * runi("spd")
         return R
 
     # ---- samplers / noise ----------------------------------------------
