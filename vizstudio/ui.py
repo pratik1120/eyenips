@@ -108,7 +108,9 @@ class ControlPanel:
             udir = os.getcwd()                      # last-ditch: stay runnable
         self._session_path = os.path.join(udir, "session.viz")
         self._presets_dir = os.path.join(udir, "presets")     # where SAVES go
-        self._builtin_presets_dir = paths.find("presets")     # bundled starters
+        # bundled, read-only starter presets (shipped with the app); fall back to
+        # a local presets/ folder in older/dev layouts
+        self._builtin_presets_dir = paths.find("starter_presets", "presets")
         self._welcome_flag = os.path.join(udir, ".welcomed")  # first-run greeting
 
     def build(self):
@@ -216,6 +218,8 @@ class ControlPanel:
         # First launch (no "seen" marker yet): greet the user with a 3-step start.
         if not os.path.exists(self._welcome_flag):
             self.root.after(250, lambda: self._show_welcome(first_run=True))
+        # quietly check for a newer release (stays silent unless one exists)
+        self.root.after(1500, lambda: self._check_updates(manual=False))
 
     # ---- dockable panels -----------------------------------------------
     def _init_panels(self):
@@ -310,8 +314,47 @@ class ControlPanel:
         help_btn.config(menu=hm)
         help_btn.pack(side="left", padx=2)
         hm.add_command(label="Quick start…", command=lambda: self._show_welcome())
+        hm.add_command(label="Check for updates…", command=lambda: self._check_updates(manual=True))
         hm.add_command(label="About Eyenips…", command=self._show_about)
         self._menus.append(hm)
+
+    def _check_updates(self, manual=False):
+        """Ask (off-thread) whether a newer release exists. `manual` also reports
+        'you're up to date'; the silent startup check stays quiet unless newer."""
+        import vizstudio
+        from . import updatecheck
+
+        def done(res):
+            # hop back onto the Tk thread before touching widgets
+            try:
+                self.root.after(0, lambda: self._update_result(res, manual))
+            except Exception:
+                pass
+        updatecheck.check_async(vizstudio.__version__, done)
+
+    def _update_result(self, res, manual):
+        if not res:
+            if manual:
+                self._set_status("You're on the latest version. ✓")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Update available")
+        win.resizable(False, False)
+        tk.Label(win, text=f"Eyenips {res['version']} is available",
+                 font=("", 13, "bold")).pack(padx=24, pady=(16, 4))
+        if res.get("notes"):
+            tk.Label(win, text=res["notes"], fg="#666", wraplength=360,
+                     justify="left").pack(padx=24, pady=(0, 8))
+        bar = tk.Frame(win)
+        bar.pack(padx=24, pady=14)
+
+        def _download():
+            if res.get("url"):
+                import webbrowser
+                webbrowser.open(res["url"])
+            win.destroy()
+        tk.Button(bar, text="Download", command=_download).pack(side="left", padx=4)
+        tk.Button(bar, text="Later", command=win.destroy).pack(side="left", padx=4)
 
     _WELCOME_STEPS = [
         ("🔊", "It's already listening",

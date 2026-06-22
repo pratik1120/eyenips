@@ -1,0 +1,139 @@
+{
+  "effect": "Effect Lab",
+  "params": {
+    "values": {
+      "trails": true,
+      "trail_length": 0.9,
+      "fluid": false,
+      "fluid_amount": 0.5,
+      "grainy": false,
+      "grain_amount": 0.3,
+      "flicker": false,
+      "flicker_amount": 0.3,
+      "fade_in": true,
+      "brightness": 1.0,
+      "feedback": false,
+      "fb_decay": 0.85,
+      "fb_zoom": 1.02,
+      "fb_rotate": 0.0,
+      "media_blend": "Off",
+      "media_opacity": 1.0,
+      "media_brightness": 1.0,
+      "subject_front": "Off",
+      "subject_strength": 1.0,
+      "subject_feather": 0.4,
+      "recipe": 164,
+      "speed": 1.0,
+      "warp": 1.0,
+      "detail": 1.0,
+      "react": 0.6,
+      "glow": 1.4,
+      "video_mix": 0.0,
+      "flow_warp": false,
+      "blob_sparks": false,
+      "spark_size": 0.6,
+      "palette": {
+        "named": "ocean",
+        "custom": []
+      }
+    },
+    "audio_src": {
+      "trail_length": "none",
+      "fluid_amount": "none",
+      "grain_amount": "none",
+      "flicker_amount": "none",
+      "brightness": "none",
+      "fb_decay": "none",
+      "fb_zoom": "none",
+      "fb_rotate": "none",
+      "media_opacity": "none",
+      "media_brightness": "none",
+      "subject_strength": "none",
+      "subject_feather": "none",
+      "recipe": "none",
+      "speed": "bass",
+      "warp": "none",
+      "detail": "treble",
+      "react": "volume",
+      "glow": "volume",
+      "video_mix": "none",
+      "spark_size": "none"
+    },
+    "audio_amt": {
+      "trail_length": 0.5,
+      "fluid_amount": 0.5,
+      "grain_amount": 0.5,
+      "flicker_amount": 0.5,
+      "brightness": 0.5,
+      "fb_decay": 0.5,
+      "fb_zoom": 0.5,
+      "fb_rotate": 0.5,
+      "media_opacity": 0.5,
+      "media_brightness": 0.5,
+      "subject_strength": 0.5,
+      "subject_feather": 0.5,
+      "recipe": 0.5,
+      "speed": 0.4,
+      "warp": 0.5,
+      "detail": 0.5,
+      "react": 0.8,
+      "glow": 0.3,
+      "video_mix": 0.5,
+      "spark_size": 0.5
+    }
+  },
+  "shape_fx": [],
+  "mods": {
+    "lfos": [
+      {
+        "shape": "sine",
+        "rate": 0.5,
+        "depth": 1.0,
+        "phase": 0.0
+      },
+      {
+        "shape": "sine",
+        "rate": 0.5,
+        "depth": 1.0,
+        "phase": 0.0
+      },
+      {
+        "shape": "sine",
+        "rate": 0.5,
+        "depth": 1.0,
+        "phase": 0.0
+      },
+      {
+        "shape": "sine",
+        "rate": 0.5,
+        "depth": 1.0,
+        "phase": 0.0
+      }
+    ]
+  },
+  "midi": {
+    "port": null,
+    "slots": [
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null
+    ]
+  },
+  "tempo": {
+    "bpm": 120.0,
+    "auto": false
+  },
+  "director": {
+    "auto_intensity": false,
+    "action": "Off",
+    "trigger": "on drop",
+    "every_bars": 8
+  },
+  "layers": [],
+  "version": 1
+}
