@@ -9,6 +9,15 @@ you want more, drop a Python file in `effects/` and it shows up automatically.
 > controls, audio reactivity, color system, and post-FX are all in place, with
 > two example effects (Liquid Fractal, Plasma).
 
+## ⬇️ Download (Windows)
+
+**[Download Eyenips for Windows →](https://github.com/pratik1120/eyenips/releases/download/v0.1.0/Eyenips-Setup-0.1.0.exe)**
+(`Eyenips-Setup-0.1.0.exe`, per-user install — no admin needed)
+
+Run the installer, then launch **Eyenips** from the Start menu. Or grab any
+build from the [Releases page](https://github.com/pratik1120/eyenips/releases/latest).
+Prefer to run from source? See [Run it](#run-it) below.
+
 ## 🧬 Effect Lab — a generative effect engine (millions of effects)
 
 Instead of a thousand hand-written effects, Eyenips **generates** them. Pick
