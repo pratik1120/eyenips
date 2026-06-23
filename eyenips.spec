@@ -83,7 +83,7 @@ coll = COLLECT(
 # effects/ (updatable), starter_presets/ (read-only shipped starters). User-saved
 # presets live in %USERPROFILE%\.eyenips and are never bundled.
 _dist_root = os.path.join(DISTPATH, "Eyenips")
-for _folder in ("effects", "starter_presets"):
+for _folder in ("effects", "starter_presets", "assets"):
     _src = os.path.abspath(_folder)
     _dst = os.path.join(_dist_root, _folder)
     if os.path.isdir(_src):

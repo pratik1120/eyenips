@@ -59,6 +59,8 @@ _DEFAULT_HIDDEN_PANELS = _FLOATING_PANELS + ("mod", "midi", "director", "export"
 # UI color themes. Keys: bg (window), panel (boxes), fg (text), accent
 # (highlights), btn (buttons), entry/entry_fg (text inputs).
 THEMES = {
+    "Eyenips":  dict(bg="#000000", panel="#0b0b0b", fg="#ffffff", accent="#e81ce8",
+                     btn="#181018", entry="#141014", entry_fg="#ffffff", meter_bg="#000"),
     "Dark":     dict(bg="#1e1e1e", panel="#252526", fg="#e0e0e0", accent="#3fd0ff",
                      btn="#3a3a3c", entry="#333333", entry_fg="#ffffff", meter_bg="#111"),
     "Light":    dict(bg="#f3f3f3", panel="#ffffff", fg="#1a1a1a", accent="#0a84ff",
@@ -119,6 +121,13 @@ class ControlPanel:
         Everything is on the main thread (Tkinter requires it)."""
         self.root = tk.Tk()
         self.root.title("Eyenips")
+        try:                                   # window/taskbar icon (frozen-safe)
+            ico = paths.find(os.path.join("assets", "eyenips.png"))
+            if os.path.exists(ico):
+                self._icon_img = tk.PhotoImage(file=ico)
+                self.root.iconphoto(True, self._icon_img)
+        except Exception:
+            pass
         self.root.geometry("1560x900")
         self.root.minsize(1100, 680)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -145,7 +154,7 @@ class ControlPanel:
         fs_btn.pack(side="left", padx=4)
         self._tip(fs_btn, "Open the visual full-screen on a projector / second "
                   "monitor (F11). Esc or double-click to exit.")
-        self.theme_var = tk.StringVar(value="Dark")
+        self.theme_var = tk.StringVar(value="Eyenips")
         # live FPS / frame-time readout (a small "pro tool" signal), right side
         self.fps_lbl = tk.Label(self.toolbar, text="—", font=("", 9), fg="#888")
         self.fps_lbl.pack(side="right", padx=10)
@@ -208,7 +217,7 @@ class ControlPanel:
         self.root.bind("<Control-y>", lambda e: self._redo())
         self.root.bind("<Control-Shift-Z>", lambda e: self._redo())
         self.root.bind("<F11>", lambda e: self._toggle_output())
-        self.apply_theme("Dark")
+        self.apply_theme("Eyenips")
 
         # restore the last session (effect, knobs, shapes, colors, layout)
         self._restore_session()
@@ -1124,7 +1133,7 @@ class ControlPanel:
 
     # ---- theming --------------------------------------------------------
     def apply_theme(self, name):
-        th = THEMES.get(name, THEMES["Dark"])
+        th = THEMES.get(name, THEMES["Eyenips"])
         self._theme = th
         if self.theme_var.get() != name:
             self.theme_var.set(name)
