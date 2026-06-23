@@ -6,6 +6,16 @@ Initializes the GPU, discovers every effect in effects/, opens the control
 panel (its own thread) and the render window (main thread).
 """
 
+import os
+import sys
+
+# When frozen, vizstudio ships as LOOSE source next to the exe (not inside the
+# PyInstaller archive) so Taichi can read each @ti.kernel's source at runtime
+# (inspect.getsource fails on archived modules). Put the exe dir on sys.path so
+# `import vizstudio` finds that loose copy — must run before importing vizstudio.
+if getattr(sys, "frozen", False):
+    sys.path.insert(0, os.path.dirname(sys.executable))
+
 import taichi as ti
 
 from vizstudio.engine import Engine

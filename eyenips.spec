@@ -32,15 +32,15 @@ for pkg in ("mediapipe", "taichi", "cv2"):
     except Exception as e:
         print(f"[spec] collect_all({pkg}) skipped: {e}")
 
-# the person-segmentation model -> _internal/vizstudio/models (paths.find finds it)
-_model = os.path.join("vizstudio", "models", "selfie_segmenter.tflite")
-if os.path.exists(_model):
-    datas += [(_model, os.path.join("vizstudio", "models"))]
-
-# optional/odd-to-detect deps that the app imports lazily
+# vizstudio is NOT frozen into the archive (see excludes below) — it ships as
+# loose source next to the exe so Taichi can read each @ti.kernel's source at
+# runtime. Because PyInstaller then can't scan vizstudio for its imports, list
+# every third-party dependency it (and the loose effects/) pull in.
 hiddenimports += [
+    "numpy", "PIL", "PIL.Image", "PIL.ImageTk", "PIL.ImageDraw",
     "soundcard", "soundfile", "sounddevice", "imageio_ffmpeg",
     "mido", "mido.backends.pygame", "pygame",
+    "tkinter", "tkinter.filedialog", "tkinter.colorchooser", "tkinter.ttk",
 ]
 
 a = Analysis(
@@ -51,7 +51,13 @@ a = Analysis(
     hiddenimports=hiddenimports,
     hookspath=[],
     runtime_hooks=[],
-    excludes=["tkinter.test", "test", "unittest"],
+    # Eyenips is Tkinter — exclude Qt bindings (pulled in transitively, e.g. via
+    # matplotlib) so PyInstaller doesn't choke on multiple Qt packages, and drop
+    # matplotlib itself (unused at runtime).
+    # vizstudio is shipped LOOSE (see below) — keep it out of the archive so the
+    # loose source wins and Taichi can read it.
+    excludes=["vizstudio", "tkinter.test", "test", "unittest",
+              "PyQt5", "PyQt6", "PySide2", "PySide6", "matplotlib"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)
@@ -83,7 +89,7 @@ coll = COLLECT(
 # effects/ (updatable), starter_presets/ (read-only shipped starters). User-saved
 # presets live in %USERPROFILE%\.eyenips and are never bundled.
 _dist_root = os.path.join(DISTPATH, "Eyenips")
-for _folder in ("effects", "starter_presets", "assets"):
+for _folder in ("vizstudio", "effects", "starter_presets", "assets"):
     _src = os.path.abspath(_folder)
     _dst = os.path.join(_dist_root, _folder)
     if os.path.isdir(_src):

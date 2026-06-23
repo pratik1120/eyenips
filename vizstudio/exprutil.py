@@ -11,11 +11,21 @@ We:
 The result is a string that can be dropped straight into a generated kernel.
 """
 
+import os
 import re
 import linecache
 from itertools import count
 
 _exec_counter = count()
+
+# Synthetic source files live (virtually) under here. The directory need not
+# exist — the source is held in linecache, not on disk — but the path MUST be
+# ABSOLUTE. PyInstaller's frozen `inspect` hook (pyi_rth_inspect) rewrites any
+# relative or "<...>" co_filename into a path under sys._MEIPASS, which then no
+# longer matches our linecache key and makes Taichi's inspect.getsource() fail
+# ("could not get source code") in the exe while working in dev. An absolute
+# path is passed through that hook unchanged, so the lookup resolves in both.
+_DYN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_dynamic")
 
 
 def exec_with_source(src, namespace, tag="vizstudio-dynamic"):
@@ -27,7 +37,7 @@ def exec_with_source(src, namespace, tag="vizstudio-dynamic"):
     kernels built at runtime (live formulas, the code editor) compile correctly.
     Returns the synthetic filename used.
     """
-    fname = f"<{tag}-{next(_exec_counter)}>"
+    fname = os.path.normpath(os.path.join(_DYN_DIR, f"{tag}-{next(_exec_counter)}.py"))
     linecache.cache[fname] = (len(src), None, src.splitlines(keepends=True), fname)
     exec(compile(src, fname, "exec"), namespace)
     return fname
